@@ -1,6 +1,6 @@
 before
 
-node.js:*
-        throw e; // process.nextTick error, or 'error' event on first tick
-              ^
+*test*message*stack_overflow.js:*
+function stackOverflow() {
+                      ^
 RangeError: Maximum call stack size exceeded

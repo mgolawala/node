@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -27,7 +27,7 @@
 
 #include "v8.h"
 
-#if defined(V8_TARGET_ARCH_IA32)
+#if V8_TARGET_ARCH_IA32
 
 #include "codegen.h"
 #include "debug.h"
@@ -49,8 +49,8 @@ bool BreakLocationIterator::IsDebugBreakAtReturn() {
 void BreakLocationIterator::SetDebugBreakAtReturn() {
   ASSERT(Assembler::kJSReturnSequenceLength >=
          Assembler::kCallInstructionLength);
-  Isolate* isolate = Isolate::Current();
-  rinfo()->PatchCodeWithCall(isolate->debug()->debug_break_return()->entry(),
+  rinfo()->PatchCodeWithCall(
+      debug_info_->GetIsolate()->debug()->debug_break_return()->entry(),
       Assembler::kJSReturnSequenceLength - Assembler::kCallInstructionLength);
 }
 
@@ -79,7 +79,7 @@ bool BreakLocationIterator::IsDebugBreakAtSlot() {
 
 void BreakLocationIterator::SetDebugBreakAtSlot() {
   ASSERT(IsDebugBreakSlot());
-  Isolate* isolate = Isolate::Current();
+  Isolate* isolate = debug_info_->GetIsolate();
   rinfo()->PatchCodeWithCall(
       isolate->debug()->debug_break_slot()->entry(),
       Assembler::kDebugBreakSlotLength - Assembler::kCallInstructionLength);
@@ -92,8 +92,11 @@ void BreakLocationIterator::ClearDebugBreakAtSlot() {
 }
 
 
-#define __ ACCESS_MASM(masm)
+// All debug break stubs support padding for LiveEdit.
+const bool Debug::FramePaddingLayout::kIsSupported = true;
 
+
+#define __ ACCESS_MASM(masm)
 
 static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
                                           RegList object_regs,
@@ -102,6 +105,13 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
   // Enter an internal frame.
   {
     FrameScope scope(masm, StackFrame::INTERNAL);
+
+    // Load padding words on stack.
+    for (int i = 0; i < Debug::FramePaddingLayout::kInitialSize; i++) {
+      __ push(Immediate(Smi::FromInt(
+          Debug::FramePaddingLayout::kPaddingValue)));
+    }
+    __ push(Immediate(Smi::FromInt(Debug::FramePaddingLayout::kInitialSize)));
 
     // Store the registers containing live values on the expression stack to
     // make sure that these are correctly updated during GC. Non object values
@@ -118,7 +128,7 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
       if ((non_object_regs & (1 << r)) != 0) {
         if (FLAG_debug_code) {
           __ test(reg, Immediate(0xc0000000));
-          __ Assert(zero, "Unable to encode value as smi");
+          __ Assert(zero, kUnableToEncodeValueAsSmi);
         }
         __ SmiTag(reg);
         __ push(reg);
@@ -134,6 +144,10 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
     CEntryStub ceb(1);
     __ CallStub(&ceb);
 
+    // Automatically find register that could be used after register restore.
+    // We need one register for padding skip instructions.
+    Register unused_reg = { -1 };
+
     // Restore the register values containing object pointers from the
     // expression stack.
     for (int i = kNumJSCallerSaved; --i >= 0;) {
@@ -142,14 +156,28 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
       if (FLAG_debug_code) {
         __ Set(reg, Immediate(kDebugZapValue));
       }
+      bool taken = reg.code() == esi.code();
       if ((object_regs & (1 << r)) != 0) {
         __ pop(reg);
+        taken = true;
       }
       if ((non_object_regs & (1 << r)) != 0) {
         __ pop(reg);
         __ SmiUntag(reg);
+        taken = true;
+      }
+      if (!taken) {
+        unused_reg = reg;
       }
     }
+
+    ASSERT(unused_reg.code() != -1);
+
+    // Read current padding counter and skip corresponding number of words.
+    __ pop(unused_reg);
+    // We divide stored value by 2 (untagging) and multiply it by word's size.
+    STATIC_ASSERT(kSmiTagSize == 1 && kSmiShiftSize == 0);
+    __ lea(esp, Operand(esp, unused_reg, times_half_pointer_size, 0));
 
     // Get rid of the internal frame.
   }
@@ -172,10 +200,10 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
 void Debug::GenerateLoadICDebugBreak(MacroAssembler* masm) {
   // Register state for IC load call (from ic-ia32.cc).
   // ----------- S t a t e -------------
-  //  -- eax    : receiver
   //  -- ecx    : name
+  //  -- edx    : receiver
   // -----------------------------------
-  Generate_DebugBreakCallHelper(masm, eax.bit() | ecx.bit(), 0, false);
+  Generate_DebugBreakCallHelper(masm, ecx.bit() | edx.bit(), 0, false);
 }
 
 
@@ -194,10 +222,10 @@ void Debug::GenerateStoreICDebugBreak(MacroAssembler* masm) {
 void Debug::GenerateKeyedLoadICDebugBreak(MacroAssembler* masm) {
   // Register state for keyed IC load call (from ic-ia32.cc).
   // ----------- S t a t e -------------
+  //  -- ecx    : key
   //  -- edx    : receiver
-  //  -- eax    : key
   // -----------------------------------
-  Generate_DebugBreakCallHelper(masm, eax.bit() | edx.bit(), 0, false);
+  Generate_DebugBreakCallHelper(masm, ecx.bit() | edx.bit(), 0, false);
 }
 
 
@@ -210,6 +238,15 @@ void Debug::GenerateKeyedStoreICDebugBreak(MacroAssembler* masm) {
   // -----------------------------------
   Generate_DebugBreakCallHelper(
       masm, eax.bit() | ecx.bit() | edx.bit(), 0, false);
+}
+
+
+void Debug::GenerateCompareNilICDebugBreak(MacroAssembler* masm) {
+  // Register state for CompareNil IC
+  // ----------- S t a t e -------------
+  //  -- eax    : value
+  // -----------------------------------
+  Generate_DebugBreakCallHelper(masm, eax.bit(), 0, false);
 }
 
 

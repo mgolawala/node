@@ -23,6 +23,7 @@
 
 #include "uv.h"
 #include "internal.h"
+#include "req-inl.h"
 
 
 static void uv_work_req_init(uv_loop_t* loop, uv_work_t* req,
@@ -54,20 +55,27 @@ static DWORD WINAPI uv_work_thread_proc(void* parameter) {
 
 int uv_queue_work(uv_loop_t* loop, uv_work_t* req, uv_work_cb work_cb,
     uv_after_work_cb after_work_cb) {
+  if (work_cb == NULL)
+    return UV_EINVAL;
+
   uv_work_req_init(loop, req, work_cb, after_work_cb);
 
   if (!QueueUserWorkItem(&uv_work_thread_proc, req, WT_EXECUTELONGFUNCTION)) {
-    uv__set_sys_error(loop, GetLastError());
-    return -1;
+    return uv_translate_sys_error(GetLastError());
   }
 
-  uv_ref(loop);
+  uv__req_register(loop, req);
   return 0;
 }
 
 
+int uv_cancel(uv_req_t* req) {
+  return UV_ENOSYS;
+}
+
+
 void uv_process_work_req(uv_loop_t* loop, uv_work_t* req) {
-  assert(req->after_work_cb);
-  req->after_work_cb(req);
-  uv_unref(loop);
+  uv__req_unregister(loop, req);
+  if(req->after_work_cb)
+    req->after_work_cb(req, 0);
 }

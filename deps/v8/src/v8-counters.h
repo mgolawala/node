@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -30,6 +30,7 @@
 
 #include "allocation.h"
 #include "counters.h"
+#include "objects.h"
 #include "v8globals.h"
 
 namespace v8 {
@@ -49,6 +50,58 @@ namespace internal {
   HT(compile_eval, V8.CompileEval)                                    \
   HT(compile_lazy, V8.CompileLazy)
 
+#define HISTOGRAM_PERCENTAGE_LIST(HP)                                 \
+  /* Heap fragmentation. */                                           \
+  HP(external_fragmentation_total,                                    \
+     V8.MemoryExternalFragmentationTotal)                             \
+  HP(external_fragmentation_old_pointer_space,                        \
+     V8.MemoryExternalFragmentationOldPointerSpace)                   \
+  HP(external_fragmentation_old_data_space,                           \
+     V8.MemoryExternalFragmentationOldDataSpace)                      \
+  HP(external_fragmentation_code_space,                               \
+     V8.MemoryExternalFragmentationCodeSpace)                         \
+  HP(external_fragmentation_map_space,                                \
+     V8.MemoryExternalFragmentationMapSpace)                          \
+  HP(external_fragmentation_cell_space,                               \
+     V8.MemoryExternalFragmentationCellSpace)                         \
+  HP(external_fragmentation_property_cell_space,                      \
+     V8.MemoryExternalFragmentationPropertyCellSpace)                 \
+  HP(external_fragmentation_lo_space,                                 \
+     V8.MemoryExternalFragmentationLoSpace)                           \
+  /* Percentages of heap committed to each space. */                  \
+  HP(heap_fraction_new_space,                                         \
+     V8.MemoryHeapFractionNewSpace)                                   \
+  HP(heap_fraction_old_pointer_space,                                 \
+     V8.MemoryHeapFractionOldPointerSpace)                            \
+  HP(heap_fraction_old_data_space,                                    \
+     V8.MemoryHeapFractionOldDataSpace)                               \
+  HP(heap_fraction_code_space,                                        \
+     V8.MemoryHeapFractionCodeSpace)                                  \
+  HP(heap_fraction_map_space,                                         \
+     V8.MemoryHeapFractionMapSpace)                                   \
+  HP(heap_fraction_cell_space,                                        \
+     V8.MemoryHeapFractionCellSpace)                                  \
+  HP(heap_fraction_property_cell_space,                               \
+     V8.MemoryHeapFractionPropertyCellSpace)                          \
+  HP(heap_fraction_lo_space,                                          \
+     V8.MemoryHeapFractionLoSpace)                                    \
+  /* Percentage of crankshafted codegen. */                           \
+  HP(codegen_fraction_crankshaft,                                     \
+     V8.CodegenFractionCrankshaft)                                    \
+
+
+#define HISTOGRAM_MEMORY_LIST(HM)                                     \
+  HM(heap_sample_total_committed, V8.MemoryHeapSampleTotalCommitted)  \
+  HM(heap_sample_total_used, V8.MemoryHeapSampleTotalUsed)            \
+  HM(heap_sample_map_space_committed,                                 \
+     V8.MemoryHeapSampleMapSpaceCommitted)                            \
+  HM(heap_sample_cell_space_committed,                                \
+     V8.MemoryHeapSampleCellSpaceCommitted)                           \
+  HM(heap_sample_property_cell_space_committed,                       \
+     V8.MemoryHeapSamplePropertyCellSpaceCommitted)                   \
+  HM(heap_sample_code_space_committed,                                \
+     V8.MemoryHeapSampleCodeSpaceCommitted)                           \
+
 
 // WARNING: STATS_COUNTER_LIST_* is a very large macro that is causing MSVC
 // Intellisense to crash.  It was broken into two macros (each of length 40
@@ -58,8 +111,6 @@ namespace internal {
 #define STATS_COUNTER_LIST_1(SC)                                      \
   /* Global Handle Count*/                                            \
   SC(global_handles, V8.GlobalHandles)                                \
-  /* Mallocs from PCRE */                                             \
-  SC(pcre_mallocs, V8.PcreMallocCount)                                \
   /* OS Memory allocated */                                           \
   SC(memory_allocated, V8.OsMemoryAllocated)                          \
   SC(normalized_maps, V8.NormalizedMaps)                              \
@@ -68,7 +119,7 @@ namespace internal {
   SC(alive_after_last_gc, V8.AliveAfterLastGC)                        \
   SC(objs_since_last_young, V8.ObjsSinceLastYoung)                    \
   SC(objs_since_last_full, V8.ObjsSinceLastFull)                      \
-  SC(symbol_table_capacity, V8.SymbolTableCapacity)                   \
+  SC(string_table_capacity, V8.StringTableCapacity)                   \
   SC(number_of_symbols, V8.NumberOfSymbols)                           \
   SC(script_wrappers, V8.ScriptWrappers)                              \
   SC(call_initialize_stubs, V8.CallInitializeStubs)                   \
@@ -78,8 +129,6 @@ namespace internal {
   SC(arguments_adaptors, V8.ArgumentsAdaptors)                        \
   SC(compilation_cache_hits, V8.CompilationCacheHits)                 \
   SC(compilation_cache_misses, V8.CompilationCacheMisses)             \
-  SC(regexp_cache_hits, V8.RegExpCacheHits)                           \
-  SC(regexp_cache_misses, V8.RegExpCacheMisses)                       \
   SC(string_ctor_calls, V8.StringConstructorCalls)                    \
   SC(string_ctor_conversions, V8.StringConstructorConversions)        \
   SC(string_ctor_cached_number, V8.StringConstructorCachedNumber)     \
@@ -97,8 +146,6 @@ namespace internal {
   SC(total_preparse_symbols_skipped, V8.TotalPreparseSymbolSkipped)   \
   /* Amount of compiled source code. */                               \
   SC(total_compile_size, V8.TotalCompileSize)                         \
-  /* Amount of source code compiled with the old codegen. */          \
-  SC(total_old_codegen_source_size, V8.TotalOldCodegenSourceSize)     \
   /* Amount of source code compiled with the full codegen. */         \
   SC(total_full_codegen_source_size, V8.TotalFullCodegenSourceSize)   \
   /* Number of contexts created from scratch. */                      \
@@ -125,8 +172,6 @@ namespace internal {
      V8.GCCompactorCausedByPromotedData)                              \
   SC(gc_compactor_caused_by_oldspace_exhaustion,                      \
      V8.GCCompactorCausedByOldspaceExhaustion)                        \
-  SC(gc_compactor_caused_by_weak_handles,                             \
-     V8.GCCompactorCausedByWeakHandles)                               \
   SC(gc_last_resort_from_js, V8.GCLastResortFromJS)                   \
   SC(gc_last_resort_from_handles, V8.GCLastResortFromHandles)         \
   /* How is the generic keyed-load stub used? */                      \
@@ -141,39 +186,9 @@ namespace internal {
   SC(keyed_call_generic_smi_dict, V8.KeyedCallGenericSmiDict)         \
   SC(keyed_call_generic_lookup_cache, V8.KeyedCallGenericLookupCache) \
   SC(keyed_call_generic_lookup_dict, V8.KeyedCallGenericLookupDict)   \
-  SC(keyed_call_generic_value_type, V8.KeyedCallGenericValueType)     \
   SC(keyed_call_generic_slow, V8.KeyedCallGenericSlow)                \
   SC(keyed_call_generic_slow_load, V8.KeyedCallGenericSlowLoad)       \
-  /* Count how much the monomorphic keyed-load stubs are hit. */      \
-  SC(keyed_load_function_prototype, V8.KeyedLoadFunctionPrototype)    \
-  SC(keyed_load_string_length, V8.KeyedLoadStringLength)              \
-  SC(keyed_load_array_length, V8.KeyedLoadArrayLength)                \
-  SC(keyed_load_constant_function, V8.KeyedLoadConstantFunction)      \
-  SC(keyed_load_field, V8.KeyedLoadField)                             \
-  SC(keyed_load_callback, V8.KeyedLoadCallback)                       \
-  SC(keyed_load_interceptor, V8.KeyedLoadInterceptor)                 \
-  SC(keyed_load_inline, V8.KeyedLoadInline)                           \
-  SC(keyed_load_inline_miss, V8.KeyedLoadInlineMiss)                  \
-  SC(named_load_inline, V8.NamedLoadInline)                           \
-  SC(named_load_inline_miss, V8.NamedLoadInlineMiss)                  \
-  SC(named_load_global_inline, V8.NamedLoadGlobalInline)              \
-  SC(named_load_global_inline_miss, V8.NamedLoadGlobalInlineMiss)     \
-  SC(dont_delete_hint_hit, V8.DontDeleteHintHit)                      \
-  SC(dont_delete_hint_miss, V8.DontDeleteHintMiss)                    \
   SC(named_load_global_stub, V8.NamedLoadGlobalStub)                  \
-  SC(named_load_global_stub_miss, V8.NamedLoadGlobalStubMiss)         \
-  SC(keyed_store_field, V8.KeyedStoreField)                           \
-  SC(named_store_inline_field, V8.NamedStoreInlineField)              \
-  SC(keyed_store_inline, V8.KeyedStoreInline)                         \
-  SC(named_load_inline_generic, V8.NamedLoadInlineGeneric)            \
-  SC(named_load_inline_field, V8.NamedLoadInlineFast)                 \
-  SC(keyed_load_inline_generic, V8.KeyedLoadInlineGeneric)            \
-  SC(keyed_load_inline_fast, V8.KeyedLoadInlineFast)                  \
-  SC(keyed_store_inline_generic, V8.KeyedStoreInlineGeneric)          \
-  SC(keyed_store_inline_fast, V8.KeyedStoreInlineFast)                \
-  SC(named_store_inline_generic, V8.NamedStoreInlineGeneric)          \
-  SC(named_store_inline_fast, V8.NamedStoreInlineFast)                \
-  SC(keyed_store_inline_miss, V8.KeyedStoreInlineMiss)                \
   SC(named_store_global_inline, V8.NamedStoreGlobalInline)            \
   SC(named_store_global_inline_miss, V8.NamedStoreGlobalInlineMiss)   \
   SC(keyed_store_polymorphic_stubs, V8.KeyedStorePolymorphicStubs)    \
@@ -195,7 +210,6 @@ namespace internal {
   SC(call_global_inline_miss, V8.CallGlobalInlineMiss)                \
   SC(constructed_objects, V8.ConstructedObjects)                      \
   SC(constructed_objects_runtime, V8.ConstructedObjectsRuntime)       \
-  SC(constructed_objects_stub, V8.ConstructedObjectsStub)             \
   SC(negative_lookups, V8.NegativeLookups)                            \
   SC(negative_lookups_miss, V8.NegativeLookupsMiss)                   \
   SC(megamorphic_stub_cache_probes, V8.MegamorphicStubCacheProbes)    \
@@ -207,9 +221,9 @@ namespace internal {
   SC(enum_cache_hits, V8.EnumCacheHits)                               \
   SC(enum_cache_misses, V8.EnumCacheMisses)                           \
   SC(zone_segment_bytes, V8.ZoneSegmentBytes)                         \
-  SC(compute_entry_frame, V8.ComputeEntryFrame)                       \
-  SC(generic_binary_stub_calls, V8.GenericBinaryStubCalls)            \
-  SC(generic_binary_stub_calls_regs, V8.GenericBinaryStubCallsRegs)   \
+  SC(fast_new_closure_total, V8.FastNewClosureTotal)                  \
+  SC(fast_new_closure_try_optimized, V8.FastNewClosureTryOptimized)   \
+  SC(fast_new_closure_install_optimized, V8.FastNewClosureInstallOptimized) \
   SC(string_add_runtime, V8.StringAddRuntime)                         \
   SC(string_add_native, V8.StringAddNative)                           \
   SC(string_add_runtime_ext_to_ascii, V8.StringAddRuntimeExtToAscii)  \
@@ -240,14 +254,40 @@ namespace internal {
   SC(transcendental_cache_miss, V8.TranscendentalCacheMiss)           \
   SC(stack_interrupts, V8.StackInterrupts)                            \
   SC(runtime_profiler_ticks, V8.RuntimeProfilerTicks)                 \
-  SC(other_ticks, V8.OtherTicks)                                      \
-  SC(js_opt_ticks, V8.JsOptTicks)                                     \
-  SC(js_non_opt_ticks, V8.JsNonoptTicks)                              \
-  SC(js_other_ticks, V8.JsOtherTicks)                                 \
-  SC(smi_checks_removed, V8.SmiChecksRemoved)                         \
-  SC(map_checks_removed, V8.MapChecksRemoved)                         \
-  SC(quote_json_char_count, V8.QuoteJsonCharacterCount)               \
-  SC(quote_json_char_recount, V8.QuoteJsonCharacterReCount)
+  SC(bounds_checks_eliminated, V8.BoundsChecksEliminated)             \
+  SC(bounds_checks_hoisted, V8.BoundsChecksHoisted)                   \
+  SC(soft_deopts_requested, V8.SoftDeoptsRequested)                   \
+  SC(soft_deopts_inserted, V8.SoftDeoptsInserted)                     \
+  SC(soft_deopts_executed, V8.SoftDeoptsExecuted)                     \
+  SC(new_space_bytes_available, V8.MemoryNewSpaceBytesAvailable)      \
+  SC(new_space_bytes_committed, V8.MemoryNewSpaceBytesCommitted)      \
+  SC(new_space_bytes_used, V8.MemoryNewSpaceBytesUsed)                \
+  SC(old_pointer_space_bytes_available,                               \
+     V8.MemoryOldPointerSpaceBytesAvailable)                          \
+  SC(old_pointer_space_bytes_committed,                               \
+     V8.MemoryOldPointerSpaceBytesCommitted)                          \
+  SC(old_pointer_space_bytes_used, V8.MemoryOldPointerSpaceBytesUsed) \
+  SC(old_data_space_bytes_available, V8.MemoryOldDataSpaceBytesAvailable) \
+  SC(old_data_space_bytes_committed, V8.MemoryOldDataSpaceBytesCommitted) \
+  SC(old_data_space_bytes_used, V8.MemoryOldDataSpaceBytesUsed)       \
+  SC(code_space_bytes_available, V8.MemoryCodeSpaceBytesAvailable)    \
+  SC(code_space_bytes_committed, V8.MemoryCodeSpaceBytesCommitted)    \
+  SC(code_space_bytes_used, V8.MemoryCodeSpaceBytesUsed)              \
+  SC(map_space_bytes_available, V8.MemoryMapSpaceBytesAvailable)      \
+  SC(map_space_bytes_committed, V8.MemoryMapSpaceBytesCommitted)      \
+  SC(map_space_bytes_used, V8.MemoryMapSpaceBytesUsed)                \
+  SC(cell_space_bytes_available, V8.MemoryCellSpaceBytesAvailable)    \
+  SC(cell_space_bytes_committed, V8.MemoryCellSpaceBytesCommitted)    \
+  SC(cell_space_bytes_used, V8.MemoryCellSpaceBytesUsed)              \
+  SC(property_cell_space_bytes_available,                             \
+     V8.MemoryPropertyCellSpaceBytesAvailable)                        \
+  SC(property_cell_space_bytes_committed,                             \
+     V8.MemoryPropertyCellSpaceBytesCommitted)                        \
+  SC(property_cell_space_bytes_used,                                  \
+     V8.MemoryPropertyCellSpaceBytesUsed)                             \
+  SC(lo_space_bytes_available, V8.MemoryLoSpaceBytesAvailable)        \
+  SC(lo_space_bytes_committed, V8.MemoryLoSpaceBytesCommitted)        \
+  SC(lo_space_bytes_used, V8.MemoryLoSpaceBytesUsed)
 
 
 // This file contains all the v8 counters that are in use.
@@ -258,29 +298,85 @@ class Counters {
   HISTOGRAM_TIMER_LIST(HT)
 #undef HT
 
+#define HP(name, caption) \
+  Histogram* name() { return &name##_; }
+  HISTOGRAM_PERCENTAGE_LIST(HP)
+#undef HP
+
+#define HM(name, caption) \
+  Histogram* name() { return &name##_; }
+  HISTOGRAM_MEMORY_LIST(HM)
+#undef HM
+
 #define SC(name, caption) \
   StatsCounter* name() { return &name##_; }
   STATS_COUNTER_LIST_1(SC)
   STATS_COUNTER_LIST_2(SC)
 #undef SC
 
+#define SC(name) \
+  StatsCounter* count_of_##name() { return &count_of_##name##_; } \
+  StatsCounter* size_of_##name() { return &size_of_##name##_; }
+  INSTANCE_TYPE_LIST(SC)
+#undef SC
+
+#define SC(name) \
+  StatsCounter* count_of_CODE_TYPE_##name() \
+    { return &count_of_CODE_TYPE_##name##_; } \
+  StatsCounter* size_of_CODE_TYPE_##name() \
+    { return &size_of_CODE_TYPE_##name##_; }
+  CODE_KIND_LIST(SC)
+#undef SC
+
+#define SC(name) \
+  StatsCounter* count_of_FIXED_ARRAY_##name() \
+    { return &count_of_FIXED_ARRAY_##name##_; } \
+  StatsCounter* size_of_FIXED_ARRAY_##name() \
+    { return &size_of_FIXED_ARRAY_##name##_; }
+  FIXED_ARRAY_SUB_INSTANCE_TYPE_LIST(SC)
+#undef SC
+
+#define SC(name) \
+  StatsCounter* count_of_CODE_AGE_##name() \
+    { return &count_of_CODE_AGE_##name##_; } \
+  StatsCounter* size_of_CODE_AGE_##name() \
+    { return &size_of_CODE_AGE_##name##_; }
+  CODE_AGE_LIST_WITH_NO_AGE(SC)
+#undef SC
+
   enum Id {
 #define RATE_ID(name, caption) k_##name,
     HISTOGRAM_TIMER_LIST(RATE_ID)
 #undef RATE_ID
+#define PERCENTAGE_ID(name, caption) k_##name,
+    HISTOGRAM_PERCENTAGE_LIST(PERCENTAGE_ID)
+#undef PERCENTAGE_ID
+#define MEMORY_ID(name, caption) k_##name,
+    HISTOGRAM_MEMORY_LIST(MEMORY_ID)
+#undef MEMORY_ID
 #define COUNTER_ID(name, caption) k_##name,
     STATS_COUNTER_LIST_1(COUNTER_ID)
     STATS_COUNTER_LIST_2(COUNTER_ID)
 #undef COUNTER_ID
-#define COUNTER_ID(name) k_##name,
-    STATE_TAG_LIST(COUNTER_ID)
+#define COUNTER_ID(name) kCountOf##name, kSizeOf##name,
+    INSTANCE_TYPE_LIST(COUNTER_ID)
+#undef COUNTER_ID
+#define COUNTER_ID(name) kCountOfCODE_TYPE_##name, \
+    kSizeOfCODE_TYPE_##name,
+    CODE_KIND_LIST(COUNTER_ID)
+#undef COUNTER_ID
+#define COUNTER_ID(name) kCountOfFIXED_ARRAY__##name, \
+    kSizeOfFIXED_ARRAY__##name,
+    FIXED_ARRAY_SUB_INSTANCE_TYPE_LIST(COUNTER_ID)
+#undef COUNTER_ID
+#define COUNTER_ID(name) kCountOfCODE_AGE__##name, \
+    kSizeOfCODE_AGE__##name,
+    CODE_AGE_LIST_WITH_NO_AGE(COUNTER_ID)
 #undef COUNTER_ID
     stats_counter_count
   };
 
-  StatsCounter* state_counters(StateTag state) {
-    return &state_counters_[state];
-  }
+  void ResetHistograms();
 
  private:
 #define HT(name, caption) \
@@ -288,22 +384,49 @@ class Counters {
   HISTOGRAM_TIMER_LIST(HT)
 #undef HT
 
+#define HP(name, caption) \
+  Histogram name##_;
+  HISTOGRAM_PERCENTAGE_LIST(HP)
+#undef HP
+
+#define HM(name, caption) \
+  Histogram name##_;
+  HISTOGRAM_MEMORY_LIST(HM)
+#undef HM
+
 #define SC(name, caption) \
   StatsCounter name##_;
   STATS_COUNTER_LIST_1(SC)
   STATS_COUNTER_LIST_2(SC)
 #undef SC
 
-  enum {
-#define COUNTER_ID(name) __##name,
-    STATE_TAG_LIST(COUNTER_ID)
-#undef COUNTER_ID
-    kSlidingStateWindowCounterCount
-  };
+#define SC(name) \
+  StatsCounter size_of_##name##_; \
+  StatsCounter count_of_##name##_;
+  INSTANCE_TYPE_LIST(SC)
+#undef SC
 
-  // Sliding state window counters.
-  StatsCounter state_counters_[kSlidingStateWindowCounterCount];
+#define SC(name) \
+  StatsCounter size_of_CODE_TYPE_##name##_; \
+  StatsCounter count_of_CODE_TYPE_##name##_;
+  CODE_KIND_LIST(SC)
+#undef SC
+
+#define SC(name) \
+  StatsCounter size_of_FIXED_ARRAY_##name##_; \
+  StatsCounter count_of_FIXED_ARRAY_##name##_;
+  FIXED_ARRAY_SUB_INSTANCE_TYPE_LIST(SC)
+#undef SC
+
+#define SC(name) \
+  StatsCounter size_of_CODE_AGE_##name##_; \
+  StatsCounter count_of_CODE_AGE_##name##_;
+  CODE_AGE_LIST_WITH_NO_AGE(SC)
+#undef SC
+
   friend class Isolate;
+
+  explicit Counters(Isolate* isolate);
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(Counters);
 };

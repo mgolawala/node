@@ -28,18 +28,22 @@
 
 
 TEST_IMPL(udp_options) {
+  static int invalid_ttls[] = { -1, 0, 256 };
+  struct sockaddr_in addr;
   uv_loop_t* loop;
   uv_udp_t h;
   int i, r;
+
+  ASSERT(0 == uv_ip4_addr("0.0.0.0", TEST_PORT, &addr));
 
   loop = uv_default_loop();
 
   r = uv_udp_init(loop, &h);
   ASSERT(r == 0);
 
-  uv_unref(loop); /* don't keep the loop alive */
+  uv_unref((uv_handle_t*)&h); /* don't keep the loop alive */
 
-  r = uv_udp_bind(&h, uv_ip4_addr("0.0.0.0", TEST_PORT), 0);
+  r = uv_udp_bind(&h, (const struct sockaddr*) &addr, 0);
   ASSERT(r == 0);
 
   r = uv_udp_set_broadcast(&h, 1);
@@ -48,17 +52,16 @@ TEST_IMPL(udp_options) {
   r |= uv_udp_set_broadcast(&h, 0);
   ASSERT(r == 0);
 
-  /* values 0-255 should work */
-  for (i = 0; i <= 255; i++) {
+  /* values 1-255 should work */
+  for (i = 1; i <= 255; i++) {
     r = uv_udp_set_ttl(&h, i);
     ASSERT(r == 0);
   }
 
-  /* anything >255 should fail */
-  r = uv_udp_set_ttl(&h, 256);
-  ASSERT(r == -1);
-  ASSERT(uv_last_error(loop).code == UV_EINVAL);
-  /* don't test ttl=-1, it's a valid value on some platforms */
+  for (i = 0; i < (int) ARRAY_SIZE(invalid_ttls); i++) {
+    r = uv_udp_set_ttl(&h, invalid_ttls[i]);
+    ASSERT(r == UV_EINVAL);
+  }
 
   r = uv_udp_set_multicast_loop(&h, 1);
   r |= uv_udp_set_multicast_loop(&h, 1);
@@ -74,12 +77,12 @@ TEST_IMPL(udp_options) {
 
   /* anything >255 should fail */
   r = uv_udp_set_multicast_ttl(&h, 256);
-  ASSERT(r == -1);
-  ASSERT(uv_last_error(loop).code == UV_EINVAL);
+  ASSERT(r == UV_EINVAL);
   /* don't test ttl=-1, it's a valid value on some platforms */
 
-  r = uv_run(loop);
+  r = uv_run(loop, UV_RUN_DEFAULT);
   ASSERT(r == 0);
 
+  MAKE_VALGRIND_HAPPY();
   return 0;
 }

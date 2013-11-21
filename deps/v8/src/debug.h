@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -38,6 +38,7 @@
 #include "frames-inl.h"
 #include "hashmap.h"
 #include "platform.h"
+#include "platform/socket.h"
 #include "string-stream.h"
 #include "v8threads.h"
 
@@ -79,6 +80,14 @@ enum BreakLocatorType {
 };
 
 
+// The different types of breakpoint position alignments.
+// Must match Debug.BreakPositionAlignment in debug-debugger.js
+enum BreakPositionAlignment {
+  STATEMENT_ALIGNED = 0,
+  BREAK_POSITION_ALIGNED = 1
+};
+
+
 // Class for iterating through the break points in a function and changing
 // them.
 class BreakLocationIterator {
@@ -90,14 +99,16 @@ class BreakLocationIterator {
   void Next();
   void Next(int count);
   void FindBreakLocationFromAddress(Address pc);
-  void FindBreakLocationFromPosition(int position);
+  void FindBreakLocationFromPosition(int position,
+      BreakPositionAlignment alignment);
   void Reset();
   bool Done() const;
   void SetBreakPoint(Handle<Object> break_point_object);
   void ClearBreakPoint(Handle<Object> break_point_object);
   void SetOneShot();
   void ClearOneShot();
-  void PrepareStepIn();
+  bool IsStepInLocation(Isolate* isolate);
+  void PrepareStepIn(Isolate* isolate);
   bool IsExit() const;
   bool HasBreakPoint();
   bool IsDebugBreak();
@@ -164,7 +175,8 @@ class BreakLocationIterator {
 // the cache is the script id.
 class ScriptCache : private HashMap {
  public:
-  ScriptCache() : HashMap(ScriptMatch), collected_scripts_(10) {}
+  explicit ScriptCache(Isolate* isolate)
+    : HashMap(ScriptMatch), isolate_(isolate), collected_scripts_(10) {}
   virtual ~ScriptCache() { Clear(); }
 
   // Add script to the cache.
@@ -189,8 +201,11 @@ class ScriptCache : private HashMap {
   void Clear();
 
   // Weak handle callback for scripts in the cache.
-  static void HandleWeakScript(v8::Persistent<v8::Value> obj, void* data);
+  static void HandleWeakScript(v8::Isolate* isolate,
+                               v8::Persistent<v8::Value>* obj,
+                               void* data);
 
+  Isolate* isolate_;
   // List used during GC to temporarily store id's of collected scripts.
   List<int> collected_scripts_;
 };
@@ -233,18 +248,26 @@ class Debug {
   void Iterate(ObjectVisitor* v);
 
   Object* Break(Arguments args);
-  void SetBreakPoint(Handle<SharedFunctionInfo> shared,
+  void SetBreakPoint(Handle<JSFunction> function,
                      Handle<Object> break_point_object,
                      int* source_position);
+  bool SetBreakPointForScript(Handle<Script> script,
+                              Handle<Object> break_point_object,
+                              int* source_position,
+                              BreakPositionAlignment alignment);
   void ClearBreakPoint(Handle<Object> break_point_object);
   void ClearAllBreakPoints();
-  void FloodWithOneShot(Handle<SharedFunctionInfo> shared);
+  void FloodWithOneShot(Handle<JSFunction> function);
   void FloodBoundFunctionWithOneShot(Handle<JSFunction> function);
   void FloodHandlerWithOneShot();
   void ChangeBreakOnException(ExceptionBreakType type, bool enable);
   bool IsBreakOnException(ExceptionBreakType type);
-  void PrepareStep(StepAction step_action, int step_count);
+  void PrepareStep(StepAction step_action,
+                   int step_count,
+                   StackFrame::Id frame_id);
   void ClearStepping();
+  void ClearStepOut();
+  bool IsStepping() { return thread_local_.step_count_ > 0; }
   bool StepNextContinue(BreakLocationIterator* break_location_iterator,
                         JavaScriptFrame* frame);
   static Handle<DebugInfo> GetDebugInfo(Handle<SharedFunctionInfo> shared);
@@ -252,8 +275,14 @@ class Debug {
 
   void PrepareForBreakPoints();
 
-  // Returns whether the operation succeeded.
-  bool EnsureDebugInfo(Handle<SharedFunctionInfo> shared);
+  // This function is used in FunctionNameUsing* tests.
+  Object* FindSharedFunctionInfoInScript(Handle<Script> script, int position);
+
+  // Returns whether the operation succeeded. Compilation can only be triggered
+  // if a valid closure is passed as the second argument, otherwise the shared
+  // function needs to be compiled already.
+  bool EnsureDebugInfo(Handle<SharedFunctionInfo> shared,
+                       Handle<JSFunction> function);
 
   // Returns true if the current stub call is patched to call the debugger.
   static bool IsDebugBreak(Address addr);
@@ -270,7 +299,8 @@ class Debug {
   static Handle<Code> FindDebugBreak(Handle<Code> code, RelocInfo::Mode mode);
 
   static Handle<Object> GetSourceBreakLocations(
-      Handle<SharedFunctionInfo> shared);
+      Handle<SharedFunctionInfo> shared,
+      BreakPositionAlignment position_aligment);
 
   // Getter for the debug_context.
   inline Handle<Context> debug_context() { return debug_context_; }
@@ -373,7 +403,9 @@ class Debug {
   static const int kEstimatedNofBreakPointsInFunction = 16;
 
   // Passed to MakeWeak.
-  static void HandleWeakDebugInfo(v8::Persistent<v8::Value> obj, void* data);
+  static void HandleWeakDebugInfo(v8::Isolate* isolate,
+                                  v8::Persistent<v8::Value>* obj,
+                                  void* data);
 
   friend class Debugger;
   friend Handle<FixedArray> GetDebuggedFunctions();  // In test-debug.cc
@@ -403,6 +435,7 @@ class Debug {
   static void GenerateStoreICDebugBreak(MacroAssembler* masm);
   static void GenerateKeyedLoadICDebugBreak(MacroAssembler* masm);
   static void GenerateKeyedStoreICDebugBreak(MacroAssembler* masm);
+  static void GenerateCompareNilICDebugBreak(MacroAssembler* masm);
   static void GenerateReturnDebugBreak(MacroAssembler* masm);
   static void GenerateCallFunctionStubDebugBreak(MacroAssembler* masm);
   static void GenerateCallFunctionStubRecordDebugBreak(MacroAssembler* masm);
@@ -432,7 +465,8 @@ class Debug {
     // The top JS frame had been calling some C++ function. The return address
     // gets patched automatically.
     FRAME_DROPPED_IN_DIRECT_CALL,
-    FRAME_DROPPED_IN_RETURN_CALL
+    FRAME_DROPPED_IN_RETURN_CALL,
+    CURRENTLY_SET_MODE
   };
 
   void FramesHaveBeenDropped(StackFrame::Id new_break_frame_id,
@@ -455,16 +489,59 @@ class Debug {
   // Architecture-specific constant.
   static const bool kFrameDropperSupported;
 
+  /**
+   * Defines layout of a stack frame that supports padding. This is a regular
+   * internal frame that has a flexible stack structure. LiveEdit can shift
+   * its lower part up the stack, taking up the 'padding' space when additional
+   * stack memory is required.
+   * Such frame is expected immediately above the topmost JavaScript frame.
+   *
+   * Stack Layout:
+   *   --- Top
+   *   LiveEdit routine frames
+   *   ---
+   *   C frames of debug handler
+   *   ---
+   *   ...
+   *   ---
+   *      An internal frame that has n padding words:
+   *      - any number of words as needed by code -- upper part of frame
+   *      - padding size: a Smi storing n -- current size of padding
+   *      - padding: n words filled with kPaddingValue in form of Smi
+   *      - 3 context/type words of a regular InternalFrame
+   *      - fp
+   *   ---
+   *      Topmost JavaScript frame
+   *   ---
+   *   ...
+   *   --- Bottom
+   */
+  class FramePaddingLayout : public AllStatic {
+   public:
+    // Architecture-specific constant.
+    static const bool kIsSupported;
+
+    // A size of frame base including fp. Padding words starts right above
+    // the base.
+    static const int kFrameBaseSize = 4;
+
+    // A number of words that should be reserved on stack for the LiveEdit use.
+    // Normally equals 1. Stored on stack in form of Smi.
+    static const int kInitialSize;
+    // A value that padding words are filled with (in form of Smi). Going
+    // bottom-top, the first word not having this value is a counter word.
+    static const int kPaddingValue;
+  };
+
  private:
   explicit Debug(Isolate* isolate);
   ~Debug();
 
-  static bool CompileDebuggerScript(int index);
+  static bool CompileDebuggerScript(Isolate* isolate, int index);
   void ClearOneShot();
   void ActivateStepIn(StackFrame* frame);
   void ClearStepIn();
   void ActivateStepOut(StackFrame* frame);
-  void ClearStepOut();
   void ClearStepNext();
   // Returns whether the compile succeeded.
   void RemoveDebugInfo(Handle<DebugInfo> debug_info);
@@ -592,6 +669,7 @@ class MessageImpl: public v8::Debug::Message {
   virtual v8::Handle<v8::String> GetJSON() const;
   virtual v8::Handle<v8::Context> GetEventContext() const;
   virtual v8::Debug::ClientData* GetClientData() const;
+  virtual v8::Isolate* GetIsolate() const;
 
  private:
   MessageImpl(bool is_event,
@@ -690,7 +768,6 @@ class MessageDispatchHelperThread;
 class LockingCommandMessageQueue BASE_EMBEDDED {
  public:
   LockingCommandMessageQueue(Logger* logger, int size);
-  ~LockingCommandMessageQueue();
   bool IsEmpty() const;
   CommandMessage Get();
   void Put(const CommandMessage& message);
@@ -698,7 +775,7 @@ class LockingCommandMessageQueue BASE_EMBEDDED {
  private:
   Logger* logger_;
   CommandMessageQueue queue_;
-  Mutex* lock_;
+  mutable Mutex mutex_;
   DISALLOW_COPY_AND_ASSIGN(LockingCommandMessageQueue);
 };
 
@@ -738,7 +815,6 @@ class Debugger {
   };
   void OnAfterCompile(Handle<Script> script,
                       AfterCompileFlags after_compile_flags);
-  void OnNewFunction(Handle<JSFunction> fun);
   void OnScriptCollected(int id);
   void ProcessDebugEvent(v8::DebugEvent event,
                          Handle<JSObject> event_data,
@@ -750,7 +826,7 @@ class Debugger {
   void SetEventListener(Handle<Object> callback, Handle<Object> data);
   void SetMessageHandler(v8::Debug::MessageHandler2 handler);
   void SetHostDispatchHandler(v8::Debug::HostDispatchHandler handler,
-                              int period);
+                              TimeDelta period);
   void SetDebugMessageDispatchHandler(
       v8::Debug::DebugMessageDispatchHandler handler,
       bool provide_locker);
@@ -792,7 +868,7 @@ class Debugger {
   friend void ForceUnloadDebugger();  // In test-debug.cc
 
   inline bool EventActive(v8::DebugEvent event) {
-    ScopedLock with(debugger_access_);
+    LockGuard<RecursiveMutex> lock_guard(debugger_access_);
 
     // Check whether the message handler was been cleared.
     if (debugger_unload_pending_) {
@@ -820,6 +896,10 @@ class Debugger {
   bool compiling_natives() const { return compiling_natives_; }
   void set_loading_debugger(bool v) { is_loading_debugger_ = v; }
   bool is_loading_debugger() const { return is_loading_debugger_; }
+  void set_live_edit_enabled(bool v) { live_edit_enabled_ = v; }
+  bool live_edit_enabled() const {
+    return FLAG_enable_liveedit && live_edit_enabled_ ;
+  }
   void set_force_debugger_active(bool force_debugger_active) {
     force_debugger_active_ = force_debugger_active;
   }
@@ -843,26 +923,27 @@ class Debugger {
                            Handle<Object> event_data);
   void ListenersChanged();
 
-  Mutex* debugger_access_;  // Mutex guarding debugger variables.
+  RecursiveMutex* debugger_access_;  // Mutex guarding debugger variables.
   Handle<Object> event_listener_;  // Global handle to listener.
   Handle<Object> event_listener_data_;
   bool compiling_natives_;  // Are we compiling natives?
   bool is_loading_debugger_;  // Are we loading the debugger?
+  bool live_edit_enabled_;  // Enable LiveEdit.
   bool never_unload_debugger_;  // Can we unload the debugger?
   bool force_debugger_active_;  // Activate debugger without event listeners.
   v8::Debug::MessageHandler2 message_handler_;
   bool debugger_unload_pending_;  // Was message handler cleared?
   v8::Debug::HostDispatchHandler host_dispatch_handler_;
-  Mutex* dispatch_handler_access_;  // Mutex guarding dispatch handler.
+  Mutex dispatch_handler_access_;  // Mutex guarding dispatch handler.
   v8::Debug::DebugMessageDispatchHandler debug_message_dispatch_handler_;
   MessageDispatchHelperThread* message_dispatch_helper_thread_;
-  int host_dispatch_micros_;
+  TimeDelta host_dispatch_period_;
 
   DebuggerAgent* agent_;
 
   static const int kQueueInitialSize = 4;
   LockingCommandMessageQueue command_queue_;
-  Semaphore* command_received_;  // Signaled for each command received.
+  Semaphore command_received_;  // Signaled for each command received.
   LockingCommandMessageQueue event_command_queue_;
 
   Isolate* isolate_;
@@ -880,7 +961,7 @@ class Debugger {
 // some reason could not be entered FailedToEnter will return true.
 class EnterDebugger BASE_EMBEDDED {
  public:
-  EnterDebugger();
+  explicit EnterDebugger(Isolate* isolate);
   ~EnterDebugger();
 
   // Check whether the debugger could be entered.
@@ -907,12 +988,12 @@ class EnterDebugger BASE_EMBEDDED {
 // Stack allocated class for disabling break.
 class DisableBreak BASE_EMBEDDED {
  public:
-  explicit DisableBreak(bool disable_break) : isolate_(Isolate::Current()) {
+  explicit DisableBreak(Isolate* isolate, bool disable_break)
+    : isolate_(isolate) {
     prev_disable_break_ = isolate_->debug()->disable_break();
     isolate_->debug()->set_disable_break(disable_break);
   }
   ~DisableBreak() {
-    ASSERT(Isolate::Current() == isolate_);
     isolate_->debug()->set_disable_break(prev_disable_break_);
   }
 
@@ -971,15 +1052,16 @@ class Debug_Address {
 class MessageDispatchHelperThread: public Thread {
  public:
   explicit MessageDispatchHelperThread(Isolate* isolate);
-  ~MessageDispatchHelperThread();
+  ~MessageDispatchHelperThread() {}
 
   void Schedule();
 
  private:
   void Run();
 
-  Semaphore* const sem_;
-  Mutex* const mutex_;
+  Isolate* isolate_;
+  Semaphore sem_;
+  Mutex mutex_;
   bool already_signalled_;
 
   DISALLOW_COPY_AND_ASSIGN(MessageDispatchHelperThread);

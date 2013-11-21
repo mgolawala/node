@@ -17,7 +17,7 @@ if [ "x$0" = "xsh" ]; then
   # on some systems, you can just do cat>npm-install.sh
   # which is a bit cuter.  But on others, &1 is already closed,
   # so catting to another script file won't do anything.
-  curl -s http://npmjs.org/install.sh > npm-install-$$.sh
+  curl -s https://npmjs.org/install.sh > npm-install-$$.sh
   sh npm-install-$$.sh
   ret=$?
   rm npm-install-$$.sh
@@ -152,14 +152,10 @@ if [ -z "$t" ]; then
   # switch based on node version.
   # note that we can only use strict sh-compatible patterns here.
   case $node_version in
-    0.[0123].* | v0.[0123].*)
+    0.[012345].* | v0.[012345].*)
       echo "You are using an outdated and unsupported version of" >&2
       echo "node ($node_version).  Please update node and try again." >&2
       exit 99
-      ;;
-    v0.[45].* | 0.[45].*)
-      echo "install npm@1.0"
-      t=1.0
       ;;
     v0.[678].* | 0.[678].*)
       echo "install npm@1.1"

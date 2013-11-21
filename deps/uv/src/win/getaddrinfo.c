@@ -24,6 +24,7 @@
 
 #include "uv.h"
 #include "internal.h"
+#include "req-inl.h"
 
 
 /*
@@ -36,13 +37,13 @@
     int ai_socktype;
     int ai_protocol;
     size_t ai_addrlen;
-    wchar_t* ai_canonname;
+    WCHAR* ai_canonname;
     struct sockaddr* ai_addr;
     struct addrinfoW* ai_next;
   } ADDRINFOW, *PADDRINFOW;
 
-  DECLSPEC_IMPORT int WSAAPI GetAddrInfoW(const wchar_t* node,
-                                          const wchar_t* service,
+  DECLSPEC_IMPORT int WSAAPI GetAddrInfoW(const WCHAR* node,
+                                          const WCHAR* service,
                                           const ADDRINFOW* hints,
                                           PADDRINFOW* result);
 
@@ -55,45 +56,23 @@
 #define ALIGNED_SIZE(X)     ((((X) + 3) >> 2) << 2)
 
 
-/*
- * getaddrinfo error code mapping
- * Falls back to uv_translate_sys_error if no match
- */
-static uv_err_code uv_translate_eai_error(int eai_errno) {
-  switch (eai_errno) {
-    case ERROR_SUCCESS:               return UV_OK;
-    case EAI_BADFLAGS:                return UV_EBADF;
-    case EAI_FAIL:                    return UV_EFAULT;
-    case EAI_FAMILY:                  return UV_EAIFAMNOSUPPORT;
-    case EAI_MEMORY:                  return UV_ENOMEM;
-    case EAI_NONAME:                  return UV_ENOENT;
-    case EAI_AGAIN:                   return UV_EAGAIN;
-    case EAI_SERVICE:                 return UV_EAISERVICE;
-    case EAI_SOCKTYPE:                return UV_EAISOCKTYPE;
-    default:                          return uv_translate_sys_error(eai_errno);
-  }
-}
-
-
 /* getaddrinfo worker thread implementation */
 static DWORD WINAPI getaddrinfo_thread_proc(void* parameter) {
-  uv_getaddrinfo_t* handle = (uv_getaddrinfo_t*) parameter;
-  uv_loop_t* loop = handle->loop;
+  uv_getaddrinfo_t* req = (uv_getaddrinfo_t*) parameter;
+  uv_loop_t* loop = req->loop;
   int ret;
 
-  assert(handle != NULL);
+  assert(req != NULL);
 
-  if (handle != NULL) {
-    /* call OS function on this thread */
-    ret = GetAddrInfoW(handle->node,
-                       handle->service,
-                       handle->hints,
-                       &handle->res);
-    handle->retcode = ret;
+  /* call OS function on this thread */
+  ret = GetAddrInfoW(req->node,
+                     req->service,
+                     req->hints,
+                     &req->res);
+  req->retcode = ret;
 
-    /* post getaddrinfo completed */
-    POST_COMPLETION_FOR_REQ(loop, &handle->getadddrinfo_req);
-  }
+  /* post getaddrinfo completed */
+  POST_COMPLETION_FOR_REQ(loop, req);
 
   return 0;
 }
@@ -108,8 +87,7 @@ static DWORD WINAPI getaddrinfo_thread_proc(void* parameter) {
  * and copy all structs and referenced strings into the one block.
  * Each size calculation is adjusted to avoid unaligned pointers.
  */
-void uv_process_getaddrinfo_req(uv_loop_t* loop, uv_getaddrinfo_t* handle,
-    uv_req_t* req) {
+void uv_process_getaddrinfo_req(uv_loop_t* loop, uv_getaddrinfo_t* req) {
   int addrinfo_len = 0;
   int name_len = 0;
   size_t addrinfo_struct_len = ALIGNED_SIZE(sizeof(struct addrinfo));
@@ -117,26 +95,26 @@ void uv_process_getaddrinfo_req(uv_loop_t* loop, uv_getaddrinfo_t* handle,
   struct addrinfo* addrinfo_ptr;
   char* alloc_ptr = NULL;
   char* cur_ptr = NULL;
-  int status = 0;
+  int err = 0;
 
   /* release input parameter memory */
-  if (handle->alloc != NULL) {
-    free(handle->alloc);
-    handle->alloc = NULL;
+  if (req->alloc != NULL) {
+    free(req->alloc);
+    req->alloc = NULL;
   }
 
-  if (handle->retcode == 0) {
+  if (req->retcode == 0) {
     /* convert addrinfoW to addrinfo */
     /* first calculate required length */
-    addrinfow_ptr = handle->res;
+    addrinfow_ptr = req->res;
     while (addrinfow_ptr != NULL) {
       addrinfo_len += addrinfo_struct_len +
           ALIGNED_SIZE(addrinfow_ptr->ai_addrlen);
       if (addrinfow_ptr->ai_canonname != NULL) {
         name_len = uv_utf16_to_utf8(addrinfow_ptr->ai_canonname, -1, NULL, 0);
         if (name_len == 0) {
-          uv__set_sys_error(loop, GetLastError());
-          status = -1;
+          /* FIXME(bnoordhuis) Retain GetLastError(). */
+          err = UV_EAI_SYSTEM;
           goto complete;
         }
         addrinfo_len += ALIGNED_SIZE(name_len);
@@ -150,7 +128,7 @@ void uv_process_getaddrinfo_req(uv_loop_t* loop, uv_getaddrinfo_t* handle,
     /* do conversions */
     if (alloc_ptr != NULL) {
       cur_ptr = alloc_ptr;
-      addrinfow_ptr = handle->res;
+      addrinfow_ptr = req->res;
 
       while (addrinfow_ptr != NULL) {
         /* copy addrinfo struct data */
@@ -201,26 +179,24 @@ void uv_process_getaddrinfo_req(uv_loop_t* loop, uv_getaddrinfo_t* handle,
         }
       }
     } else {
-      uv__set_artificial_error(loop, UV_ENOMEM);
-      status = -1;
+      err = UV_EAI_MEMORY;
     }
   } else {
     /* GetAddrInfo failed */
-    uv__set_artificial_error(loop, uv_translate_eai_error(handle->retcode));
-    status = -1;
+    err = uv__getaddrinfo_translate_error(req->retcode);
   }
 
   /* return memory to system */
-  if (handle->res != NULL) {
-    FreeAddrInfoW(handle->res);
-    handle->res = NULL;
+  if (req->res != NULL) {
+    FreeAddrInfoW(req->res);
+    req->res = NULL;
   }
 
 complete:
-  /* finally do callback with converted result */
-  handle->getaddrinfo_cb(handle, status, (struct addrinfo*)alloc_ptr);
+  uv__req_unregister(loop, req);
 
-  uv_unref(loop);
+  /* finally do callback with converted result */
+  req->getaddrinfo_cb(req, err, (struct addrinfo*)alloc_ptr);
 }
 
 
@@ -237,10 +213,10 @@ void uv_freeaddrinfo(struct addrinfo* ai) {
 /*
  * Entry point for getaddrinfo
  * we convert the UTF-8 strings to UNICODE
- * and save the UNICODE string pointers in the handle
+ * and save the UNICODE string pointers in the req
  * We also copy hints so that caller does not need to keep memory until the
  * callback.
- * return UV_OK if a callback will be made
+ * return 0 if a callback will be made
  * return error code if validation fails
  *
  * To minimize allocation we calculate total size required,
@@ -248,7 +224,7 @@ void uv_freeaddrinfo(struct addrinfo* ai) {
  * Each size calculation is adjusted to avoid unaligned pointers.
  */
 int uv_getaddrinfo(uv_loop_t* loop,
-                   uv_getaddrinfo_t* handle,
+                   uv_getaddrinfo_t* req,
                    uv_getaddrinfo_cb getaddrinfo_cb,
                    const char* node,
                    const char* service,
@@ -257,34 +233,35 @@ int uv_getaddrinfo(uv_loop_t* loop,
   int servicesize = 0;
   int hintssize = 0;
   char* alloc_ptr = NULL;
+  int err;
 
-  if (handle == NULL || getaddrinfo_cb == NULL ||
+  if (req == NULL || getaddrinfo_cb == NULL ||
      (node == NULL && service == NULL)) {
-    uv__set_sys_error(loop, WSAEINVAL);
+    err = WSAEINVAL;
     goto error;
   }
 
-  uv_req_init(loop, (uv_req_t*)handle);
+  uv_req_init(loop, (uv_req_t*)req);
 
-  handle->getaddrinfo_cb = getaddrinfo_cb;
-  handle->res = NULL;
-  handle->type = UV_GETADDRINFO;
-  handle->loop = loop;
+  req->getaddrinfo_cb = getaddrinfo_cb;
+  req->res = NULL;
+  req->type = UV_GETADDRINFO;
+  req->loop = loop;
 
   /* calculate required memory size for all input values */
   if (node != NULL) {
-    nodesize = ALIGNED_SIZE(uv_utf8_to_utf16(node, NULL, 0) * sizeof(wchar_t));
+    nodesize = ALIGNED_SIZE(uv_utf8_to_utf16(node, NULL, 0) * sizeof(WCHAR));
     if (nodesize == 0) {
-      uv__set_sys_error(loop, GetLastError());
+      err = GetLastError();
       goto error;
     }
   }
 
   if (service != NULL) {
     servicesize = ALIGNED_SIZE(uv_utf8_to_utf16(service, NULL, 0) *
-                               sizeof(wchar_t));
+                               sizeof(WCHAR));
     if (servicesize == 0) {
-      uv__set_sys_error(loop, GetLastError());
+      err = GetLastError();
       goto error;
     }
   }
@@ -295,78 +272,73 @@ int uv_getaddrinfo(uv_loop_t* loop,
   /* allocate memory for inputs, and partition it as needed */
   alloc_ptr = (char*)malloc(nodesize + servicesize + hintssize);
   if (!alloc_ptr) {
-    uv__set_sys_error(loop, WSAENOBUFS);
+    err = WSAENOBUFS;
     goto error;
   }
 
   /* save alloc_ptr now so we can free if error */
-  handle->alloc = (void*)alloc_ptr;
+  req->alloc = (void*)alloc_ptr;
 
   /* convert node string to UTF16 into allocated memory and save pointer in */
-  /* handle */
+  /* the reques. */
   if (node != NULL) {
-    handle->node = (wchar_t*)alloc_ptr;
+    req->node = (WCHAR*)alloc_ptr;
     if (uv_utf8_to_utf16(node,
-                         (wchar_t*) alloc_ptr,
-                         nodesize / sizeof(wchar_t)) == 0) {
-      uv__set_sys_error(loop, GetLastError());
+                         (WCHAR*) alloc_ptr,
+                         nodesize / sizeof(WCHAR)) == 0) {
+      err = GetLastError();
       goto error;
     }
     alloc_ptr += nodesize;
   } else {
-    handle->node = NULL;
+    req->node = NULL;
   }
 
   /* convert service string to UTF16 into allocated memory and save pointer */
-  /* in handle */
+  /* in the req. */
   if (service != NULL) {
-    handle->service = (wchar_t*)alloc_ptr;
+    req->service = (WCHAR*)alloc_ptr;
     if (uv_utf8_to_utf16(service,
-                         (wchar_t*) alloc_ptr,
-                         servicesize / sizeof(wchar_t)) == 0) {
-      uv__set_sys_error(loop, GetLastError());
+                         (WCHAR*) alloc_ptr,
+                         servicesize / sizeof(WCHAR)) == 0) {
+      err = GetLastError();
       goto error;
     }
     alloc_ptr += servicesize;
   } else {
-    handle->service = NULL;
+    req->service = NULL;
   }
 
-  /* copy hints to allocated memory and save pointer in handle */
+  /* copy hints to allocated memory and save pointer in req */
   if (hints != NULL) {
-    handle->hints = (struct addrinfoW*)alloc_ptr;
-    handle->hints->ai_family = hints->ai_family;
-    handle->hints->ai_socktype = hints->ai_socktype;
-    handle->hints->ai_protocol = hints->ai_protocol;
-    handle->hints->ai_flags = hints->ai_flags;
-    handle->hints->ai_addrlen = 0;
-    handle->hints->ai_canonname = NULL;
-    handle->hints->ai_addr = NULL;
-    handle->hints->ai_next = NULL;
+    req->hints = (struct addrinfoW*)alloc_ptr;
+    req->hints->ai_family = hints->ai_family;
+    req->hints->ai_socktype = hints->ai_socktype;
+    req->hints->ai_protocol = hints->ai_protocol;
+    req->hints->ai_flags = hints->ai_flags;
+    req->hints->ai_addrlen = 0;
+    req->hints->ai_canonname = NULL;
+    req->hints->ai_addr = NULL;
+    req->hints->ai_next = NULL;
   } else {
-    handle->hints = NULL;
+    req->hints = NULL;
   }
-
-  /* init request for Post handling */
-  uv_req_init(loop, &handle->getadddrinfo_req);
-  handle->getadddrinfo_req.data = handle;
-  handle->getadddrinfo_req.type = UV_GETADDRINFO_REQ;
 
   /* Ask thread to run. Treat this as a long operation */
   if (QueueUserWorkItem(&getaddrinfo_thread_proc,
-                        handle,
+                        req,
                         WT_EXECUTELONGFUNCTION) == 0) {
-    uv__set_sys_error(loop, GetLastError());
+    err = GetLastError();
     goto error;
   }
 
-  uv_ref(loop);
+  uv__req_register(loop, req);
 
   return 0;
 
 error:
-  if (handle != NULL && handle->alloc != NULL) {
-    free(handle->alloc);
+  if (req != NULL && req->alloc != NULL) {
+    free(req->alloc);
   }
-  return -1;
+  return uv_translate_sys_error(err);
 }

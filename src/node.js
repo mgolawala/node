@@ -25,17 +25,29 @@
 // bootstrapping the node.js core. Special caution is given to the performance
 // of the startup process, so many dependencies are invoked lazily.
 (function(process) {
-  global = this;
+  this.global = this;
+  var _errorHandler;
 
   function startup() {
     var EventEmitter = NativeModule.require('events').EventEmitter;
-    process.__proto__ = EventEmitter.prototype;
+
+    process.__proto__ = Object.create(EventEmitter.prototype, {
+      constructor: {
+        value: process.constructor
+      }
+    });
+    EventEmitter.call(process);
+
     process.EventEmitter = EventEmitter; // process.EventEmitter is deprecated
+
+    // do this good and early, since it handles errors.
+    startup.processFatal();
 
     startup.globalVariables();
     startup.globalTimeouts();
     startup.globalConsole();
 
+    startup.processAsyncListener();
     startup.processAssert();
     startup.processConfig();
     startup.processNextTick();
@@ -44,6 +56,8 @@
     startup.processSignalHandlers();
 
     startup.processChannel();
+
+    startup.processRawDebug();
 
     startup.resolveArgv0();
 
@@ -67,25 +81,20 @@
 
     } else if (process._eval != null) {
       // User passed '-e' or '--eval' arguments to Node.
-      var Module = NativeModule.require('module');
-      var path = NativeModule.require('path');
-      var cwd = process.cwd();
-
-      var module = new Module('eval');
-      module.filename = path.join(cwd, 'eval');
-      module.paths = Module._nodeModulePaths(cwd);
-      var result = module._compile('return eval(process._eval)', 'eval');
-      if (process._print_eval) console.log(result);
+      evalScript('[eval]');
     } else if (process.argv[1]) {
       // make process.argv[1] into a full path
       var path = NativeModule.require('path');
       process.argv[1] = path.resolve(process.argv[1]);
 
-      // If this is a worker in cluster mode, start up the communiction
+      // If this is a worker in cluster mode, start up the communication
       // channel.
       if (process.env.NODE_UNIQUE_ID) {
         var cluster = NativeModule.require('cluster');
         cluster._setupWorker();
+
+        // Make sure it's not accidentally inherited by child processes.
+        delete process.env.NODE_UNIQUE_ID;
       }
 
       var Module = NativeModule.require('module');
@@ -106,13 +115,12 @@
         // global.v8debug object about a connection, and runMain when
         // that occurs.  --isaacs
 
-        setTimeout(Module.runMain, 50);
+        var debugTimeout = +process.env.NODE_DEBUG_TIMEOUT || 50;
+        setTimeout(Module.runMain, debugTimeout);
 
       } else {
-        // REMOVEME: nextTick should not be necessary. This hack to get
-        // test/simple/test-exception-handler2.js working.
         // Main entry point into most programs:
-        process.nextTick(Module.runMain);
+        Module.runMain();
       }
 
     } else {
@@ -138,7 +146,6 @@
 
       } else {
         // Read all of stdin - execute it.
-        process.stdin.resume();
         process.stdin.setEncoding('utf8');
 
         var code = '';
@@ -147,7 +154,8 @@
         });
 
         process.stdin.on('end', function() {
-          new Module()._compile(code, '[stdin]');
+          process._eval = code;
+          evalScript('[stdin]');
         });
       }
     }
@@ -159,6 +167,8 @@
     global.GLOBAL = global;
     global.root = global;
     global.Buffer = NativeModule.require('buffer').Buffer;
+    process.domain = null;
+    process._exiting = false;
   };
 
   startup.globalTimeouts = function() {
@@ -181,6 +191,16 @@
       var t = NativeModule.require('timers');
       return t.clearInterval.apply(this, arguments);
     };
+
+    global.setImmediate = function() {
+      var t = NativeModule.require('timers');
+      return t.setImmediate.apply(this, arguments);
+    };
+
+    global.clearImmediate = function() {
+      var t = NativeModule.require('timers');
+      return t.clearImmediate.apply(this, arguments);
+    };
   };
 
   startup.globalConsole = function() {
@@ -199,11 +219,312 @@
     return startup._lazyConstants;
   };
 
+  startup.processFatal = function() {
+    process._fatalException = function(er) {
+      // First run through error handlers from asyncListener.
+      var caught = _errorHandler(er);
+
+      if (!caught)
+        caught = process.emit('uncaughtException', er);
+
+      // If someone handled it, then great. Otherwise die in C++ since
+      // that means we'll exit the process, emit the 'exit' event.
+      if (!caught) {
+        try {
+          if (!process._exiting) {
+            process._exiting = true;
+            process.emit('exit', 1);
+          }
+        } catch (er) {
+          // nothing to be done about it at this point.
+        }
+
+      // if we handled an error, then make sure any ticks get processed
+      } else {
+        var t = setImmediate(process._tickCallback);
+        // Complete hack to make sure any errors thrown from async
+        // listeners don't cause an infinite loop.
+        if (t._asyncQueue)
+          t._asyncQueue = [];
+      }
+
+      return caught;
+    };
+  };
+
+  startup.processAsyncListener = function() {
+    var asyncStack = [];
+    var asyncQueue = [];
+    var uid = 0;
+
+    // Stateful flags shared with Environment for quick JS/C++
+    // communication.
+    var asyncFlags = {};
+
+    // Prevent accidentally suppressed thrown errors from before/after.
+    var inAsyncTick = false;
+
+    // To prevent infinite recursion when an error handler also throws
+    // flag when an error is currenly being handled.
+    var inErrorTick = false;
+
+    // Needs to be the same as src/env.h
+    var kCount = 0;
+
+    // _errorHandler is scoped so it's also accessible by _fatalException.
+    _errorHandler = errorHandler;
+
+    // Needs to be accessible from lib/timers.js so they know when async
+    // listeners are currently in queue. They'll be cleaned up once
+    // references there are made.
+    process._asyncFlags = asyncFlags;
+    process._runAsyncQueue = runAsyncQueue;
+    process._loadAsyncQueue = loadAsyncQueue;
+    process._unloadAsyncQueue = unloadAsyncQueue;
+
+    // Public API.
+    process.createAsyncListener = createAsyncListener;
+    process.addAsyncListener = addAsyncListener;
+    process.removeAsyncListener = removeAsyncListener;
+
+    // Setup shared objects/callbacks with native layer.
+    process._setupAsyncListener(asyncFlags,
+                                runAsyncQueue,
+                                loadAsyncQueue,
+                                unloadAsyncQueue,
+                                pushListener,
+                                stripListener);
+
+    function popQueue() {
+      if (asyncStack.length > 0)
+        asyncQueue = asyncStack.pop();
+      else
+        asyncQueue = [];
+    }
+
+    // Run all the async listeners attached when an asynchronous event is
+    // instantiated.
+    function runAsyncQueue(context) {
+      var queue = [];
+      var queueItem, item, i, value;
+
+      inAsyncTick = true;
+      for (i = 0; i < asyncQueue.length; i++) {
+        queueItem = asyncQueue[i];
+        // Not passing "this" context because it hasn't actually been
+        // instantiated yet, so accessing some of the object properties
+        // can cause a segfault.
+        // Passing the original value will allow users to manipulate the
+        // original value object, while also allowing them to return a
+        // new value for current async call tracking.
+        value = queueItem.listener(queueItem.value);
+        if (typeof value !== 'undefined') {
+          item = {
+            callbacks: queueItem.callbacks,
+            value: value,
+            listener: queueItem.listener,
+            uid: queueItem.uid
+          };
+        } else {
+          item = queueItem;
+        }
+        queue[i] = item;
+      }
+      inAsyncTick = false;
+
+      context._asyncQueue = queue;
+    }
+
+    // Uses the _asyncQueue object attached by runAsyncQueue.
+    function loadAsyncQueue(context) {
+      var queue = context._asyncQueue;
+      var item, before, i;
+
+      asyncStack.push(asyncQueue);
+      asyncQueue = queue;
+      // Since the async listener callback is required, the number of
+      // objects in the asyncQueue implies the number of async listeners
+      // there are to be processed.
+      asyncFlags[kCount] = queue.length;
+
+      // Run "before" callbacks.
+      inAsyncTick = true;
+      for (i = 0; i < queue.length; i++) {
+        item = queue[i];
+        if (!item.callbacks)
+          continue;
+        before = item.callbacks.before;
+        if (typeof before === 'function')
+          before(context, item.value);
+      }
+      inAsyncTick = false;
+    }
+
+    // Unload one level of the async stack. Returns true if there are
+    // still listeners somewhere in the stack.
+    function unloadAsyncQueue(context) {
+      var item, after, i;
+
+      // Run "after" callbacks.
+      inAsyncTick = true;
+      for (i = 0; i < asyncQueue.length; i++) {
+        item = asyncQueue[i];
+        if (!item.callbacks)
+          continue;
+        after = item.callbacks.after;
+        if (typeof after === 'function')
+          after(context, item.value);
+      }
+      inAsyncTick = false;
+
+      // Unload the current queue from the stack.
+      popQueue();
+
+      asyncFlags[kCount] = asyncQueue.length;
+
+      return asyncQueue.length > 0 || asyncStack.length > 0;
+    }
+
+    // Create new async listener object. Useful when instantiating a new
+    // object and want the listener instance, but not add it to the stack.
+    function createAsyncListener(listener, callbacks, value) {
+      return {
+        callbacks: callbacks,
+        value: value,
+        listener: listener,
+        uid: uid++
+      };
+    }
+
+    // Add a listener to the current queue.
+    function addAsyncListener(listener, callbacks, value) {
+      // Accept new listeners or previous created listeners.
+      if (typeof listener === 'function')
+        callbacks = createAsyncListener(listener, callbacks, value);
+      else
+        callbacks = listener;
+
+      var inQueue = false;
+      // The asyncQueue will be small. Probably always <= 3 items.
+      for (var i = 0; i < asyncQueue.length; i++) {
+        if (callbacks.uid === asyncQueue[i].uid) {
+          inQueue = true;
+          break;
+        }
+      }
+
+      // Make sure the callback doesn't already exist in the queue.
+      if (!inQueue)
+        asyncQueue.push(callbacks);
+
+      asyncFlags[kCount] = asyncQueue.length;
+      return callbacks;
+    }
+
+    // Remove listener from the current queue and the entire stack.
+    function removeAsyncListener(obj) {
+      var i, j;
+
+      for (i = 0; i < asyncQueue.length; i++) {
+        if (obj.uid === asyncQueue[i].uid) {
+          asyncQueue.splice(i, 1);
+          break;
+        }
+      }
+
+      for (i = 0; i < asyncStack.length; i++) {
+        for (j = 0; j < asyncStack[i].length; j++) {
+          if (obj.uid === asyncStack[i][j].uid) {
+            asyncStack[i].splice(j, 1);
+            break;
+          }
+        }
+      }
+
+      asyncFlags[kCount] = asyncQueue.length;
+    }
+
+    // Error handler used by _fatalException to run through all error
+    // callbacks in the current asyncQueue.
+    function errorHandler(er) {
+      var handled = false;
+      var error, item, i;
+
+      if (inErrorTick)
+        return false;
+
+      inErrorTick = true;
+      for (i = 0; i < asyncQueue.length; i++) {
+        item = asyncQueue[i];
+        if (!item.callbacks)
+          continue;
+        error = item.callbacks.error;
+        if (typeof error === 'function') {
+          try {
+            var threw = true;
+            handled = error(item.value, er) || handled;
+            threw = false;
+          } finally {
+            // If the error callback throws then we're going to die
+            // quickly with no chance of recovery. Only thing we're going
+            // to allow is execution of process exit event callbacks.
+            if (threw) {
+              process._exiting = true;
+              process.emit('exit', 1);
+            }
+          }
+        }
+      }
+      inErrorTick = false;
+
+      // Unload the current queue from the stack.
+      popQueue();
+
+      return handled && !inAsyncTick;
+    }
+
+    // Used by AsyncWrap::AddAsyncListener() to add an individual listener
+    // to the async queue. It will check the uid of the listener and only
+    // allow it to be added once.
+    function pushListener(obj) {
+      if (!this._asyncQueue)
+        this._asyncQueue = [];
+
+      var queue = this._asyncQueue;
+      var inQueue = false;
+      // The asyncQueue will be small. Probably always <= 3 items.
+      for (var i = 0; i < queue.length; i++) {
+        if (obj.uid === queue.uid) {
+          inQueue = true;
+          break;
+        }
+      }
+
+      if (!inQueue)
+        queue.push(obj);
+    }
+
+    // Used by AsyncWrap::RemoveAsyncListener() to remove an individual
+    // listener from the async queue, and return whether there are still
+    // listeners in the queue.
+    function stripListener(obj) {
+      if (!this._asyncQueue || this._asyncQueue.length === 0)
+        return false;
+
+      // The asyncQueue will be small. Probably always <= 3 items.
+      for (var i = 0; i < this._asyncQueue.length; i++) {
+        if (obj.uid === this._asyncQueue[i].uid) {
+          this._asyncQueue.splice(i, 1);
+          break;
+        }
+      }
+
+      return this._asyncQueue.length > 0;
+    }
+  };
+
   var assert;
   startup.processAssert = function() {
-    // Note that calls to assert() are pre-processed out by JS2C for the
-    // normal build of node. They persist only in the node_g build.
-    // Similarly for debug().
     assert = process.assert = function(x, msg) {
       if (!x) throw new Error(msg || 'assertion error');
     };
@@ -222,46 +543,111 @@
       if (value === 'false') return false;
       return value;
     });
-  }
+  };
 
   startup.processNextTick = function() {
     var nextTickQueue = [];
+    var asyncFlags = process._asyncFlags;
+    var _runAsyncQueue = process._runAsyncQueue;
+    var _loadAsyncQueue = process._loadAsyncQueue;
+    var _unloadAsyncQueue = process._unloadAsyncQueue;
 
-    process._tickCallback = function() {
-      var l = nextTickQueue.length;
-      if (l === 0) return;
+    // This tickInfo thing is used so that the C++ code in src/node.cc
+    // can have easy accesss to our nextTick state, and avoid unnecessary
+    var tickInfo = {};
 
-      var q = nextTickQueue;
-      nextTickQueue = [];
+    // *Must* match Environment::TickInfo::Fields in src/env.h.
+    var kIndex = 0;
+    var kLength = 1;
 
-      try {
-        for (var i = 0; i < l; i++) q[i]();
-      }
-      catch (e) {
-        if (i + 1 < l) {
-          nextTickQueue = q.slice(i + 1).concat(nextTickQueue);
+    // For asyncFlags.
+    // *Must* match Environment::AsyncListeners::Fields in src/env.h
+    var kCount = 0;
+
+    process.nextTick = nextTick;
+    // Needs to be accessible from beyond this scope.
+    process._tickCallback = _tickCallback;
+
+    process._setupNextTick(tickInfo, _tickCallback);
+
+    function tickDone() {
+      if (tickInfo[kLength] !== 0) {
+        if (tickInfo[kLength] <= tickInfo[kIndex]) {
+          nextTickQueue = [];
+          tickInfo[kLength] = 0;
+        } else {
+          nextTickQueue.splice(0, tickInfo[kIndex]);
+          tickInfo[kLength] = nextTickQueue.length;
         }
-        if (nextTickQueue.length) {
-          process._needTickCallback();
-        }
-        throw e; // process.nextTick error, or 'error' event on first tick
       }
-    };
+      tickInfo[kIndex] = 0;
+    }
 
-    process.nextTick = function(callback) {
-      nextTickQueue.push(callback);
-      process._needTickCallback();
-    };
+    // Run callbacks that have no domain.
+    function _tickCallback() {
+      var callback, hasQueue, threw, tock;
+
+      while (tickInfo[kIndex] < tickInfo[kLength]) {
+        tock = nextTickQueue[tickInfo[kIndex]++];
+        callback = tock.callback;
+        threw = true;
+        hasQueue = !!tock._asyncQueue;
+        if (hasQueue)
+          _loadAsyncQueue(tock);
+        try {
+          callback();
+          threw = false;
+        } finally {
+          if (threw)
+            tickDone();
+        }
+        if (hasQueue)
+          _unloadAsyncQueue(tock);
+      }
+
+      tickDone();
+    }
+
+    function nextTick(callback) {
+      // on the way out, don't bother. it won't get fired anyway.
+      if (process._exiting)
+        return;
+
+      var obj = {
+        callback: callback,
+        _asyncQueue: undefined
+      };
+
+      if (asyncFlags[kCount] > 0)
+        _runAsyncQueue(obj);
+
+      nextTickQueue.push(obj);
+      tickInfo[kLength]++;
+    }
   };
 
-  function errnoException(errorno, syscall) {
-    // TODO make this more compatible with ErrnoException from src/node.cc
-    // Once all of Node is using this function the ErrnoException from
-    // src/node.cc should be removed.
-    var e = new Error(syscall + ' ' + errorno);
-    e.errno = e.code = errorno;
-    e.syscall = syscall;
-    return e;
+  function evalScript(name) {
+    var Module = NativeModule.require('module');
+    var path = NativeModule.require('path');
+    var cwd = process.cwd();
+
+    var module = new Module(name);
+    module.filename = path.join(cwd, name);
+    module.paths = Module._nodeModulePaths(cwd);
+    var script = process._eval;
+    if (!Module._contextLoad) {
+      var body = script;
+      script = 'global.__filename = ' + JSON.stringify(name) + ';\n' +
+               'global.exports = exports;\n' +
+               'global.module = module;\n' +
+               'global.__dirname = __dirname;\n' +
+               'global.require = require;\n' +
+               'return require("vm").runInThisContext(' +
+               JSON.stringify(body) + ', { filename: ' +
+               JSON.stringify(name) + ' });\n';
+    }
+    var result = module._compile(script, name + '-wrapper');
+    if (process._print_eval) console.log(result);
   }
 
   function createWritableStdioStream(fd) {
@@ -290,14 +676,20 @@
         break;
 
       case 'PIPE':
+      case 'TCP':
         var net = NativeModule.require('net');
-        stream = new net.Stream(fd);
+        stream = new net.Socket({
+          fd: fd,
+          readable: false,
+          writable: true
+        });
 
-        // FIXME Should probably have an option in net.Stream to create a
+        // FIXME Should probably have an option in net.Socket to create a
         // stream from an existing fd which is writable only. But for now
         // we'll just add this hack and set the `readable` member to false.
         // Test: ./node test/fixtures/echo.js < /etc/passwd
         stream.readable = false;
+        stream.read = null;
         stream._type = 'pipe';
 
         // FIXME Hack to have stream not keep the event loop alive.
@@ -357,18 +749,26 @@
       switch (tty_wrap.guessHandleType(fd)) {
         case 'TTY':
           var tty = NativeModule.require('tty');
-          stdin = new tty.ReadStream(fd);
+          stdin = new tty.ReadStream(fd, {
+            highWaterMark: 0,
+            readable: true,
+            writable: false
+          });
           break;
 
         case 'FILE':
           var fs = NativeModule.require('fs');
-          stdin = new fs.ReadStream(null, {fd: fd});
+          stdin = new fs.ReadStream(null, { fd: fd });
           break;
 
         case 'PIPE':
+        case 'TCP':
           var net = NativeModule.require('net');
-          stdin = new net.Stream(fd);
-          stdin.readable = true;
+          stdin = new net.Socket({
+            fd: fd,
+            readable: true,
+            writable: false
+          });
           break;
 
         default:
@@ -380,8 +780,23 @@
       stdin.fd = fd;
 
       // stdin starts out life in a paused state, but node doesn't
-      // know yet.  Call pause() explicitly to unref() it.
-      stdin.pause();
+      // know yet.  Explicitly to readStop() it to put it in the
+      // not-reading state.
+      if (stdin._handle && stdin._handle.readStop) {
+        stdin._handle.reading = false;
+        stdin._readableState.reading = false;
+        stdin._handle.readStop();
+      }
+
+      // if the user calls stdin.pause(), then we need to stop reading
+      // immediately, so that the process can close down.
+      stdin.on('pause', function() {
+        if (!stdin._handle)
+          return;
+        stdin._readableState.reading = false;
+        stdin._handle.reading = false;
+        stdin._handle.readStop();
+      });
 
       return stdin;
     });
@@ -393,74 +808,87 @@
   };
 
   startup.processKillAndExit = function() {
-    var exiting = false;
-
+    process.exitCode = 0;
     process.exit = function(code) {
-      if (!exiting) {
-        exiting = true;
-        process.emit('exit', code || 0);
+      if (code || code === 0)
+        process.exitCode = code;
+
+      if (!process._exiting) {
+        process._exiting = true;
+        process.emit('exit', process.exitCode || 0);
       }
-      process.reallyExit(code || 0);
+      process.reallyExit(process.exitCode || 0);
     };
 
     process.kill = function(pid, sig) {
-      var r;
+      var err;
 
       // preserve null signal
       if (0 === sig) {
-        r = process._kill(pid, 0);
+        err = process._kill(pid, 0);
       } else {
         sig = sig || 'SIGTERM';
         if (startup.lazyConstants()[sig]) {
-          r = process._kill(pid, startup.lazyConstants()[sig]);
+          err = process._kill(pid, startup.lazyConstants()[sig]);
         } else {
           throw new Error('Unknown signal: ' + sig);
         }
       }
 
-      if (r) {
-        throw errnoException(errno, 'kill');
+      if (err) {
+        var errnoException = NativeModule.require('util')._errnoException;
+        throw errnoException(err, 'kill');
       }
+
+      return true;
     };
   };
 
   startup.processSignalHandlers = function() {
     // Load events module in order to access prototype elements on process like
     // process.addListener.
-    var signalWatchers = {};
+    var signalWraps = {};
     var addListener = process.addListener;
     var removeListener = process.removeListener;
 
     function isSignal(event) {
-      return event.slice(0, 3) === 'SIG' && startup.lazyConstants()[event];
+      return event.slice(0, 3) === 'SIG' &&
+             startup.lazyConstants().hasOwnProperty(event);
     }
 
     // Wrap addListener for the special signal types
     process.on = process.addListener = function(type, listener) {
-      var ret = addListener.apply(this, arguments);
-      if (isSignal(type)) {
-        if (!signalWatchers.hasOwnProperty(type)) {
-          var b = process.binding('signal_watcher');
-          var w = new b.SignalWatcher(startup.lazyConstants()[type]);
-          w.callback = function() { process.emit(type); };
-          signalWatchers[type] = w;
-          w.start();
+      if (isSignal(type) &&
+          !signalWraps.hasOwnProperty(type)) {
+        var Signal = process.binding('signal_wrap').Signal;
+        var wrap = new Signal();
 
-        } else if (this.listeners(type).length === 1) {
-          signalWatchers[type].start();
+        wrap.unref();
+
+        wrap.onsignal = function() { process.emit(type); };
+
+        var signum = startup.lazyConstants()[type];
+        var err = wrap.start(signum);
+        if (err) {
+          wrap.close();
+          var errnoException = NativeModule.require('util')._errnoException;
+          throw errnoException(err, 'uv_signal_start');
         }
+
+        signalWraps[type] = wrap;
       }
 
-      return ret;
+      return addListener.apply(this, arguments);
     };
 
     process.removeListener = function(type, listener) {
       var ret = removeListener.apply(this, arguments);
       if (isSignal(type)) {
-        assert(signalWatchers.hasOwnProperty(type));
+        assert(signalWraps.hasOwnProperty(type));
 
         if (this.listeners(type).length === 0) {
-          signalWatchers[type].stop();
+          signalWraps[type].close();
+          delete signalWraps[type];
         }
       }
 
@@ -473,7 +901,12 @@
     // If we were spawned with env NODE_CHANNEL_FD then load that up and
     // start parsing data from that stream.
     if (process.env.NODE_CHANNEL_FD) {
-      assert(parseInt(process.env.NODE_CHANNEL_FD) >= 0);
+      var fd = parseInt(process.env.NODE_CHANNEL_FD, 10);
+      assert(fd >= 0);
+
+      // Make sure it's not accidentally inherited by child processes.
+      delete process.env.NODE_CHANNEL_FD;
+
       var cp = NativeModule.require('child_process');
 
       // Load tcp_wrap to avoid situation where we might immediately receive
@@ -481,10 +914,20 @@
       // FIXME is this really necessary?
       process.binding('tcp_wrap');
 
-      cp._forkChild();
+      cp._forkChild(fd);
       assert(process.send);
     }
-  }
+  };
+
+
+  startup.processRawDebug = function() {
+    var format = NativeModule.require('util').format;
+    var rawDebug = process._rawDebug;
+    process._rawDebug = function() {
+      rawDebug(format.apply(null, arguments));
+    };
+  };
+
 
   startup.resolveArgv0 = function() {
     var cwd = process.cwd();
@@ -506,8 +949,11 @@
   // core modules found in lib/*.js. All core modules are compiled into the
   // node binary, so they can be loaded faster.
 
-  var Script = process.binding('evals').NodeScript;
-  var runInThisContext = Script.runInThisContext;
+  var ContextifyScript = process.binding('contextify').ContextifyScript;
+  function runInThisContext(code, options) {
+    var script = new ContextifyScript(code, options);
+    return script.runInThisContext();
+  }
 
   function NativeModule(id) {
     this.filename = id + '.js';
@@ -537,8 +983,8 @@
 
     var nativeModule = new NativeModule(id);
 
-    nativeModule.compile();
     nativeModule.cache();
+    nativeModule.compile();
 
     return nativeModule.exports;
   };
@@ -568,7 +1014,7 @@
     var source = NativeModule.getSource(this.id);
     source = NativeModule.wrap(source);
 
-    var fn = runInThisContext(source, this.filename, true);
+    var fn = runInThisContext(source, { filename: this.filename });
     fn(this.exports, NativeModule.require, this, this.filename);
 
     this.loaded = true;
@@ -576,35 +1022,6 @@
 
   NativeModule.prototype.cache = function() {
     NativeModule._cache[this.id] = this;
-  };
-
-  // Wrap a core module's method in a wrapper that will warn on first use
-  // and then return the result of invoking the original function. After
-  // first being called the original method is restored.
-  NativeModule.prototype.deprecate = function(method, message) {
-    var original = this.exports[method];
-    var self = this;
-    var warned = false;
-    message = message || '';
-
-    Object.defineProperty(this.exports, method, {
-      enumerable: false,
-      value: function() {
-        if (!warned) {
-          warned = true;
-          message = self.id + '.' + method + ' is deprecated. ' + message;
-
-          var moduleIdCheck = new RegExp('\\b' + self.id + '\\b');
-          if (moduleIdCheck.test(process.env.NODE_DEBUG))
-            console.trace(message);
-          else
-            console.error(message);
-
-          self.exports[method] = original;
-        }
-        return original.apply(this, arguments);
-      }
-    });
   };
 
   startup();

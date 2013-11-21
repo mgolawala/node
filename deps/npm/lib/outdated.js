@@ -20,23 +20,20 @@ outdated.completion = require("./utils/completion/installed-deep.js")
 
 var path = require("path")
   , fs = require("graceful-fs")
-  , readJson = require("./utils/read-json.js")
+  , readJson = require("read-package-json")
   , cache = require("./cache.js")
   , asyncMap = require("slide").asyncMap
   , npm = require("./npm.js")
-  , log = require("./utils/log.js")
-  , semver = require("semver")
-  , relativize = require("./utils/relativize.js")
+  , url = require("url")
 
 function outdated (args, silent, cb) {
   if (typeof cb !== "function") cb = silent, silent = false
   var dir = path.resolve(npm.dir, "..")
   outdated_(args, dir, {}, function (er, list) {
-    function cb_ (er) { cb(er, list) }
-
-    if (er || silent) return cb_(er)
+    if (er || silent) return cb(er, list)
     var outList = list.map(makePretty)
-    require("./utils/output.js").write(outList.join("\n"), cb_)
+    console.log(outList.join("\n"))
+    cb(null, list)
   })
 }
 
@@ -48,6 +45,7 @@ function makePretty (p) {
     , dir = path.resolve(p[0], "node_modules", dep)
     , has = p[2]
     , want = p[3]
+    , latest = p[4]
 
   // XXX add --json support
   // Should match (more or less) the output of ls --json
@@ -62,10 +60,12 @@ function makePretty (p) {
   }
 
   if (!npm.config.get("global")) {
-    dir = relativize(dir, process.cwd()+"/x")
+    dir = path.relative(process.cwd(), dir)
   }
-  return dep + "@" + want + " " + dir
+  return dep + " " + dir
        + " current=" + (has || "MISSING")
+       + " wanted=" + want
+       + " latest=" + latest
 }
 
 function outdated_ (args, dir, parentHas, cb) {
@@ -79,7 +79,19 @@ function outdated_ (args, dir, parentHas, cb) {
 
   var deps = null
   readJson(path.resolve(dir, "package.json"), function (er, d) {
-    deps = (er) ? true : d.dependencies
+    if (er && er.code !== "ENOENT" && er.code !== "ENOTDIR") return cb(er)
+    deps = (er) ? true : (d.dependencies || {})
+    var doUpdate = npm.config.get("dev") ||
+                    (!npm.config.get("production") &&
+                    !Object.keys(parentHas).length &&
+                    !npm.config.get("global"))
+    if (!er && d && doUpdate) {
+      Object.keys(d.devDependencies || {}).forEach(function (k) {
+        if (!(k in parentHas)) {
+          deps[k] = d.devDependencies[k]
+        }
+      })
+    }
     return next()
   })
 
@@ -89,17 +101,25 @@ function outdated_ (args, dir, parentHas, cb) {
       has = Object.create(parentHas)
       return next()
     }
+    pkgs = pkgs.filter(function (p) {
+      return !p.match(/^[\._-]/)
+    })
     asyncMap(pkgs, function (pkg, cb) {
-      readJson( path.resolve(dir, "node_modules", pkg, "package.json")
-              , function (er, d) {
-        cb(null, er ? [] : [[d.name, d.version]])
+      var jsonFile = path.resolve(dir, "node_modules", pkg, "package.json")
+      readJson(jsonFile, function (er, d) {
+        if (er && er.code !== "ENOENT" && er.code !== "ENOTDIR") return cb(er)
+        cb(null, er ? [] : [[d.name, d.version, d._from]])
       })
     }, function (er, pvs) {
       if (er) return cb(er)
       has = Object.create(parentHas)
       pvs.forEach(function (pv) {
-        has[pv[0]] = pv[1]
+        has[pv[0]] = {
+          version: pv[1],
+          from: pv[2]
+        }
       })
+
       next()
     })
   })
@@ -112,6 +132,7 @@ function outdated_ (args, dir, parentHas, cb) {
         return l
       }, {})
     }
+
     // now get what we should have, based on the dep.
     // if has[dep] !== shouldHave[dep], then cb with the data
     // otherwise dive into the folder
@@ -126,6 +147,9 @@ function shouldUpdate (args, dir, dep, has, req, cb) {
   // if that's what we already have, or if it's not on the args list,
   // then dive into it.  Otherwise, cb() with the data.
 
+  // { version: , from: }
+  var curr = has[dep]
+
   function skip () {
     outdated_( args
              , path.resolve(dir, "node_modules", dep)
@@ -133,18 +157,35 @@ function shouldUpdate (args, dir, dep, has, req, cb) {
              , cb )
   }
 
-  function doIt (shouldHave) {
-    cb(null, [[ dir, dep, has[dep], shouldHave ]])
+  function doIt (wanted, latest) {
+    cb(null, [[ dir, dep, curr && curr.version, wanted, latest, req ]])
   }
 
   if (args.length && args.indexOf(dep) === -1) {
     return skip()
   }
 
-  // so, we can conceivably update this.  find out if we need to.
-  cache.add(dep, req, function (er, d) {
-    // if this fails, then it means we can't update this thing.
-    // it's probably a thing that isn't published.
-    return (er || d.version === has[dep]) ? skip() : doIt(d.version)
+  var registry = npm.registry
+  // search for the latest package
+  registry.get(dep + "/latest", function (er, l) {
+    if (er) return cb()
+    // so, we can conceivably update this.  find out if we need to.
+    cache.add(dep, req, function (er, d) {
+      // if this fails, then it means we can't update this thing.
+      // it's probably a thing that isn't published.
+      if (er) return skip()
+
+      // check that the url origin hasn't changed (#1727) and that
+      // there is no newer version available
+      var dFromUrl = d._from && url.parse(d._from).protocol
+      var cFromUrl = curr && curr.from && url.parse(curr.from).protocol
+
+      if (!curr || dFromUrl && cFromUrl && d._from !== curr.from
+          || d.version !== curr.version
+          || d.version !== l.version)
+        doIt(d.version, l.version)
+      else
+        skip()
+    })
   })
 }

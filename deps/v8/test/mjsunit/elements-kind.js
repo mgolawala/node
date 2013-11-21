@@ -26,6 +26,12 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Flags: --allow-natives-syntax --smi-only-arrays --expose-gc
+// Flags: --notrack_allocation_sites
+
+// Limit the number of stress runs to reduce polymorphism it defeats some of the
+// assumptions made about how elements transitions work because transition stubs
+// end up going generic.
+// Flags: --stress-runs=2
 
 // Test element kind of objects.
 // Since --smi-only-arrays affects builtins, its default setting at compile
@@ -34,7 +40,7 @@
 // in this test case.  Depending on whether smi-only arrays are actually
 // enabled, this test takes the appropriate code path to check smi-only arrays.
 
-support_smi_only_arrays = %HasFastSmiOnlyElements(new Array(1,2,3,4,5,6,7,8));
+support_smi_only_arrays = %HasFastSmiElements(new Array(1,2,3,4,5,6,7,8));
 
 if (support_smi_only_arrays) {
   print("Tests include smi-only arrays.");
@@ -59,8 +65,8 @@ var elements_kind = {
 }
 
 function getKind(obj) {
-  if (%HasFastSmiOnlyElements(obj)) return elements_kind.fast_smi_only;
-  if (%HasFastElements(obj)) return elements_kind.fast;
+  if (%HasFastSmiElements(obj)) return elements_kind.fast_smi_only;
+  if (%HasFastObjectElements(obj)) return elements_kind.fast;
   if (%HasFastDoubleElements(obj)) return elements_kind.fast_double;
   if (%HasDictionaryElements(obj)) return elements_kind.dictionary;
   // Every external kind is also an external array.
@@ -116,7 +122,7 @@ if (support_smi_only_arrays) {
   assertKind(elements_kind.fast_smi_only, too);
 }
 
-// Make sure the element kind transitions from smionly when a non-smi is stored.
+// Make sure the element kind transitions from smi when a non-smi is stored.
 var you = new Array();
 assertKind(elements_kind.fast_smi_only, you);
 for (var i = 0; i < 1337; i++) {
@@ -143,7 +149,7 @@ assertKind(elements_kind.external_int,            new Int32Array(0xF));
 assertKind(elements_kind.external_unsigned_int,   new Uint32Array(23));
 assertKind(elements_kind.external_float,          new Float32Array(7));
 assertKind(elements_kind.external_double,         new Float64Array(0));
-assertKind(elements_kind.external_pixel,          new PixelArray(512));
+assertKind(elements_kind.external_pixel,          new Uint8ClampedArray(512));
 
 // Crankshaft support for smi-only array elements.
 function monomorphic(array) {
@@ -164,18 +170,21 @@ for (var i = 0; i < 3; i++) monomorphic(smi_only);
 monomorphic(smi_only);
 
 if (support_smi_only_arrays) {
+  %NeverOptimizeFunction(construct_smis);
   function construct_smis() {
     var a = [0, 0, 0];
     a[0] = 0;  // Send the COW array map to the steak house.
     assertKind(elements_kind.fast_smi_only, a);
     return a;
   }
+  %NeverOptimizeFunction(construct_doubles);
   function construct_doubles() {
     var a = construct_smis();
     a[0] = 1.5;
     assertKind(elements_kind.fast_double, a);
     return a;
   }
+  %NeverOptimizeFunction(construct_objects);
   function construct_objects() {
     var a = construct_smis();
     a[0] = "one";
@@ -184,6 +193,7 @@ if (support_smi_only_arrays) {
   }
 
   // Test crankshafted transition SMI->DOUBLE.
+  %NeverOptimizeFunction(convert_to_double);
   function convert_to_double(array) {
     array[1] = 2.5;
     assertKind(elements_kind.fast_double, array);
@@ -195,6 +205,7 @@ if (support_smi_only_arrays) {
   smis = construct_smis();
   convert_to_double(smis);
   // Test crankshafted transitions SMI->FAST and DOUBLE->FAST.
+  %NeverOptimizeFunction(convert_to_fast);
   function convert_to_fast(array) {
     array[1] = "two";
     assertKind(elements_kind.fast, array);
@@ -211,6 +222,7 @@ if (support_smi_only_arrays) {
   convert_to_fast(doubles);
   // Test transition chain SMI->DOUBLE->FAST (crankshafted function will
   // transition to FAST directly).
+  %NeverOptimizeFunction(convert_mixed);
   function convert_mixed(array, value, kind) {
     array[1] = value;
     assertKind(kind, array);
@@ -224,9 +236,11 @@ if (support_smi_only_arrays) {
   for (var i = 0; i < 3; i++) {
     convert_mixed(doubles, "three", elements_kind.fast);
   }
+  convert_mixed(construct_smis(), "three", elements_kind.fast);
+  convert_mixed(construct_doubles(), "three", elements_kind.fast);
+  %OptimizeFunctionOnNextCall(convert_mixed);
   smis = construct_smis();
   doubles = construct_doubles();
-  %OptimizeFunctionOnNextCall(convert_mixed);
   convert_mixed(smis, 1, elements_kind.fast);
   convert_mixed(doubles, 1, elements_kind.fast);
   assertTrue(%HaveSameMap(smis, doubles));
@@ -319,8 +333,7 @@ if (support_smi_only_arrays) {
   assertKind(elements_kind.fast_double, b);
   var c = a.concat(b);
   assertEquals([1, 2, 4.5, 5.5], c);
-  // TODO(1810): Change implementation so that we get DOUBLE elements here?
-  assertKind(elements_kind.fast, c);
+  assertKind(elements_kind.fast_double, c);
 }
 
 // Test that Array.push() correctly handles SMI elements.

@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -27,7 +27,7 @@
 
 #include "v8.h"
 
-#if defined(V8_TARGET_ARCH_X64)
+#if V8_TARGET_ARCH_X64
 
 #include "assembler.h"
 #include "codegen.h"
@@ -48,11 +48,10 @@ bool BreakLocationIterator::IsDebugBreakAtReturn()  {
 // CodeGenerator::VisitReturnStatement and VirtualFrame::Exit in codegen-x64.cc
 // for the precise return instructions sequence.
 void BreakLocationIterator::SetDebugBreakAtReturn()  {
-  ASSERT(Assembler::kJSReturnSequenceLength >=
-         Assembler::kCallInstructionLength);
+  ASSERT(Assembler::kJSReturnSequenceLength >= Assembler::kCallSequenceLength);
   rinfo()->PatchCodeWithCall(
-      Isolate::Current()->debug()->debug_break_return()->entry(),
-      Assembler::kJSReturnSequenceLength - Assembler::kCallInstructionLength);
+      debug_info_->GetIsolate()->debug()->debug_break_return()->entry(),
+      Assembler::kJSReturnSequenceLength - Assembler::kCallSequenceLength);
 }
 
 
@@ -81,8 +80,8 @@ bool BreakLocationIterator::IsDebugBreakAtSlot() {
 void BreakLocationIterator::SetDebugBreakAtSlot() {
   ASSERT(IsDebugBreakSlot());
   rinfo()->PatchCodeWithCall(
-      Isolate::Current()->debug()->debug_break_slot()->entry(),
-      Assembler::kDebugBreakSlotLength - Assembler::kCallInstructionLength);
+      debug_info_->GetIsolate()->debug()->debug_break_slot()->entry(),
+      Assembler::kDebugBreakSlotLength - Assembler::kCallSequenceLength);
 }
 
 
@@ -90,6 +89,8 @@ void BreakLocationIterator::ClearDebugBreakAtSlot() {
   ASSERT(IsDebugBreakSlot());
   rinfo()->PatchCode(original_rinfo()->pc(), Assembler::kDebugBreakSlotLength);
 }
+
+const bool Debug::FramePaddingLayout::kIsSupported = true;
 
 
 #define __ ACCESS_MASM(masm)
@@ -102,6 +103,12 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
   // Enter an internal frame.
   {
     FrameScope scope(masm, StackFrame::INTERNAL);
+
+    // Load padding words on stack.
+    for (int i = 0; i < Debug::FramePaddingLayout::kInitialSize; i++) {
+      __ Push(Smi::FromInt(Debug::FramePaddingLayout::kPaddingValue));
+    }
+    __ Push(Smi::FromInt(Debug::FramePaddingLayout::kInitialSize));
 
     // Store the registers containing live values on the expression stack to
     // make sure that these are correctly updated during GC. Non object values
@@ -116,14 +123,8 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
       if ((object_regs & (1 << r)) != 0) {
         __ push(reg);
       }
-      // Store the 64-bit value as two smis.
       if ((non_object_regs & (1 << r)) != 0) {
-        __ movq(kScratchRegister, reg);
-        __ Integer32ToSmi(reg, reg);
-        __ push(reg);
-        __ sar(kScratchRegister, Immediate(32));
-        __ Integer32ToSmi(kScratchRegister, kScratchRegister);
-        __ push(kScratchRegister);
+        __ PushInt64AsTwoSmis(reg);
       }
     }
 
@@ -148,14 +149,14 @@ static void Generate_DebugBreakCallHelper(MacroAssembler* masm,
       }
       // Reconstruct the 64-bit value from two smis.
       if ((non_object_regs & (1 << r)) != 0) {
-        __ pop(kScratchRegister);
-        __ SmiToInteger32(kScratchRegister, kScratchRegister);
-        __ shl(kScratchRegister, Immediate(32));
-        __ pop(reg);
-        __ SmiToInteger32(reg, reg);
-        __ or_(reg, kScratchRegister);
+        __ PopInt64AsTwoSmis(reg);
       }
     }
+
+    // Read current padding counter and skip corresponding number of words.
+    __ pop(kScratchRegister);
+    __ SmiToInteger32(kScratchRegister, kScratchRegister);
+    __ lea(rsp, Operand(rsp, kScratchRegister, times_pointer_size, 0));
 
     // Get rid of the internal frame.
   }
@@ -217,6 +218,15 @@ void Debug::GenerateKeyedStoreICDebugBreak(MacroAssembler* masm) {
   // -----------------------------------
   Generate_DebugBreakCallHelper(
       masm, rax.bit() | rcx.bit() | rdx.bit(), 0, false);
+}
+
+
+void Debug::GenerateCompareNilICDebugBreak(MacroAssembler* masm) {
+  // Register state for CompareNil IC
+  // ----------- S t a t e -------------
+  //  -- rax    : value
+  // -----------------------------------
+  Generate_DebugBreakCallHelper(masm, rax.bit(), 0, false);
 }
 
 

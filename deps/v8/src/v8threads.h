@@ -1,4 +1,4 @@
-// Copyright 2008 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -57,6 +57,7 @@ class ThreadState {
 
  private:
   explicit ThreadState(ThreadManager* thread_manager);
+  ~ThreadState();
 
   void AllocateSpace();
 
@@ -114,9 +115,11 @@ class ThreadManager {
   ThreadManager();
   ~ThreadManager();
 
+  void DeleteThreadStateList(ThreadState* anchor);
+
   void EagerlyArchiveThread();
 
-  Mutex* mutex_;
+  Mutex mutex_;
   ThreadId mutex_owner_;
   ThreadId lazily_archived_thread_;
   ThreadState* lazily_archived_thread_state_;
@@ -143,10 +146,10 @@ class ThreadManager {
 class ContextSwitcher: public Thread {
  public:
   // Set the preemption interval for the ContextSwitcher thread.
-  static void StartPreemption(int every_n_ms);
+  static void StartPreemption(Isolate* isolate, int every_n_ms);
 
   // Stop sending preemption requests to threads.
-  static void StopPreemption();
+  static void StopPreemption(Isolate* isolate);
 
   // Preempted thread needs to call back to the ContextSwitcher to acknowledge
   // the handling of a preemption request.

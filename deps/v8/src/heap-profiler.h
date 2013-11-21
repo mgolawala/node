@@ -28,6 +28,7 @@
 #ifndef V8_HEAP_PROFILER_H_
 #define V8_HEAP_PROFILER_H_
 
+#include "heap-snapshot-generator-inl.h"
 #include "isolate.h"
 
 namespace v8 {
@@ -36,33 +37,40 @@ namespace internal {
 class HeapSnapshot;
 class HeapSnapshotsCollection;
 
-#define HEAP_PROFILE(heap, call)                                             \
-  do {                                                                       \
-    v8::internal::HeapProfiler* profiler = heap->isolate()->heap_profiler(); \
-    if (profiler != NULL && profiler->is_profiling()) {                      \
-      profiler->call;                                                        \
-    }                                                                        \
-  } while (false)
-
-// The HeapProfiler writes data to the log files, which can be postprocessed
-// to generate .hp files for use by the GHC/Valgrind tool hp2ps.
 class HeapProfiler {
  public:
-  static void SetUp();
-  static void TearDown();
+  explicit HeapProfiler(Heap* heap);
+  ~HeapProfiler();
 
-  static HeapSnapshot* TakeSnapshot(const char* name,
-                                    int type,
-                                    v8::ActivityControl* control);
-  static HeapSnapshot* TakeSnapshot(String* name,
-                                    int type,
-                                    v8::ActivityControl* control);
-  static int GetSnapshotsCount();
-  static HeapSnapshot* GetSnapshot(int index);
-  static HeapSnapshot* FindSnapshot(unsigned uid);
-  static void DeleteAllSnapshots();
+  size_t GetMemorySizeUsedByProfiler();
 
-  void ObjectMoveEvent(Address from, Address to);
+  HeapSnapshot* TakeSnapshot(
+      const char* name,
+      v8::ActivityControl* control,
+      v8::HeapProfiler::ObjectNameResolver* resolver);
+  HeapSnapshot* TakeSnapshot(
+      String* name,
+      v8::ActivityControl* control,
+      v8::HeapProfiler::ObjectNameResolver* resolver);
+
+  void StartHeapObjectsTracking();
+  void StopHeapObjectsTracking();
+
+  static void RecordObjectAllocationFromMasm(Isolate* isolate,
+                                             Address obj,
+                                             int size);
+
+  SnapshotObjectId PushHeapObjectsStats(OutputStream* stream);
+  int GetSnapshotsCount();
+  HeapSnapshot* GetSnapshot(int index);
+  SnapshotObjectId GetSnapshotObjectId(Handle<Object> obj);
+  void DeleteAllSnapshots();
+
+  void ObjectMoveEvent(Address from, Address to, int size);
+
+  void NewObjectEvent(Address addr, int size);
+
+  void UpdateObjectSizeEvent(Address addr, int size);
 
   void DefineWrapperClass(
       uint16_t class_id, v8::HeapProfiler::WrapperInfoCallback callback);
@@ -73,20 +81,28 @@ class HeapProfiler {
     return snapshots_->is_tracking_objects();
   }
 
+  void SetRetainedObjectInfo(UniqueId id, RetainedObjectInfo* info);
+
+  bool is_tracking_allocations() {
+    return is_tracking_allocations_;
+  }
+
+  void StartHeapAllocationsRecording();
+  void StopHeapAllocationsRecording();
+
+  int FindUntrackedObjects() {
+    return snapshots_->FindUntrackedObjects();
+  }
+
+  void DropCompiledCode();
+
  private:
-  HeapProfiler();
-  ~HeapProfiler();
-  HeapSnapshot* TakeSnapshotImpl(const char* name,
-                                 int type,
-                                 v8::ActivityControl* control);
-  HeapSnapshot* TakeSnapshotImpl(String* name,
-                                 int type,
-                                 v8::ActivityControl* control);
-  void ResetSnapshots();
+  Heap* heap() const { return snapshots_->heap(); }
 
   HeapSnapshotsCollection* snapshots_;
   unsigned next_snapshot_uid_;
   List<v8::HeapProfiler::WrapperInfoCallback> wrapper_callbacks_;
+  bool is_tracking_allocations_;
 };
 
 } }  // namespace v8::internal

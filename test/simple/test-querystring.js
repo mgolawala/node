@@ -55,7 +55,9 @@ var qsTestCases = [
     { hasOwnProperty: 'x',
       toString: 'foo',
       valueOf: 'bar',
-      __defineGetter__: 'baz' }]
+      __defineGetter__: 'baz' }],
+  // See: https://github.com/joyent/node/issues/3058
+  ['foo&bar=baz', 'foo=&bar=baz', { foo: '', bar: 'baz' }]
 ];
 
 // [ wonkyQS, canonicalQS, obj ]
@@ -89,9 +91,8 @@ var qsWeirdObjects = [
 ];
 // }}}
 
-var Script = require('vm').Script;
-var foreignObject = Script.runInContext('({"foo": ["bar", "baz"]})',
-                                        Script.createContext());
+var vm = require('vm');
+var foreignObject = vm.runInNewContext('({"foo": ["bar", "baz"]})');
 
 var qsNoMungeTestCases = [
   ['', {}],

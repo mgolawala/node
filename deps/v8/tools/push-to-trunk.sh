@@ -130,6 +130,7 @@ if [ $START_STEP -le $CURRENT_STEP ] ; then
         | grep "^BUG=" | grep -v "BUG=$" | grep -v "BUG=none$" \
         | sed -e 's/^/        /' \
         | sed -e 's/BUG=v8:\(.*\)$/(issue \1)/' \
+        | sed -e 's/BUG=chromium:\(.*\)$/(Chromium issue \1)/' \
         | sed -e 's/BUG=\(.*\)$/(Chromium issue \1)/' \
         >> "$CHANGELOG_ENTRY_FILE"
     # Append the commit's author for reference.
@@ -210,7 +211,8 @@ if [ $START_STEP -le $CURRENT_STEP ] ; then
     };
     print $0;
   }' > "$CHANGELOG_ENTRY_FILE"
-  git cl dcommit || die "'git cl dcommit' failed, please try again."
+  PRESUBMIT_TREE_CHECK="skip" git cl dcommit \
+    || die "'git cl dcommit' failed, please try again."
 fi
 
 let CURRENT_STEP+=1
@@ -267,7 +269,6 @@ if [ $START_STEP -le $CURRENT_STEP ] ; then
   echo ">>> Step $CURRENT_STEP: Apply squashed changes."
   rm -f "$TOUCHED_FILES_FILE"
   apply_patch "$PATCH_FILE"
-  stage_files
   rm -f "$PATCH_FILE"
 fi
 
@@ -303,11 +304,22 @@ fi
 let CURRENT_STEP+=1
 if [ $START_STEP -le $CURRENT_STEP ] ; then
   echo ">>> Step $CURRENT_STEP: Commit to SVN."
-  git svn dcommit | tee >(grep -E "^Committed r[0-9]+" \
-                          | sed -e 's/^Committed r\([0-9]\+\)/\1/' \
-                          > "$TRUNK_REVISION_FILE") \
+  git svn dcommit 2>&1 | tee >(grep -E "^Committed r[0-9]+" \
+                               | sed -e 's/^Committed r\([0-9]\+\)/\1/' \
+                               > "$TRUNK_REVISION_FILE") \
     || die "'git svn dcommit' failed."
   TRUNK_REVISION=$(cat "$TRUNK_REVISION_FILE")
+  # Sometimes grepping for the revision fails. No idea why. If you figure
+  # out why it is flaky, please do fix it properly.
+  if [ -z "$TRUNK_REVISION" ] ; then
+    echo "Sorry, grepping for the SVN revision failed. Please look for it in \
+the last command's output above and provide it manually (just the number, \
+without the leading \"r\")."
+    while [ -z "$TRUNK_REVISION" ] ; do
+      echo -n "> "
+      read TRUNK_REVISION
+    done
+  fi
   persist "TRUNK_REVISION"
   rm -f "$TRUNK_REVISION_FILE"
 fi
@@ -318,6 +330,14 @@ if [ $START_STEP -le $CURRENT_STEP ] ; then
   restore_version_if_unset
   git svn tag $MAJOR.$MINOR.$BUILD -m "Tagging version $MAJOR.$MINOR.$BUILD" \
     || die "'git svn tag' failed."
+fi
+
+if [ -z "$CHROME_PATH" ] ; then
+  echo ">>> (asking for Chromium checkout)"
+  echo -n "Do you have a \"NewGit\" Chromium checkout and want this script \
+to automate creation of the roll CL? If yes, enter the path to (and including) \
+the \"src\" directory here, otherwise just press <Return>: "
+  read CHROME_PATH
 fi
 
 if [ -n "$CHROME_PATH" ] ; then

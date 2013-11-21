@@ -32,42 +32,54 @@ TEST_IMPL(platform_output) {
   uv_interface_address_t* interfaces;
   int count;
   int i;
-  uv_err_t err;
+  int err;
 
   err = uv_get_process_title(buffer, sizeof(buffer));
-  ASSERT(UV_OK == err.code);
-  fprintf(stderr, "uv_get_process_title: %s\n", buffer);
+  ASSERT(err == 0);
+  printf("uv_get_process_title: %s\n", buffer);
 
   err = uv_resident_set_memory(&rss);
-  ASSERT(UV_OK == err.code);
-  fprintf(stderr, "uv_resident_set_memory: %zu\n", rss);
+  ASSERT(err == 0);
+  printf("uv_resident_set_memory: %llu\n", (unsigned long long) rss);
 
   err = uv_uptime(&uptime);
-  ASSERT(UV_OK == err.code);
-  fprintf(stderr, "uv_uptime: %f\n", uptime);
+  ASSERT(err == 0);
+  ASSERT(uptime > 0);
+  printf("uv_uptime: %f\n", uptime);
 
   err = uv_cpu_info(&cpus, &count);
-  ASSERT(UV_OK == err.code);
+  ASSERT(err == 0);
 
-  fprintf(stderr, "uv_cpu_info:\n");
+  printf("uv_cpu_info:\n");
   for (i = 0; i < count; i++) {
-    fprintf(stderr, "  model: %s\n", cpus[i].model);
-    fprintf(stderr, "  speed: %d\n", cpus[i].speed);
-    fprintf(stderr, "  times.sys: %zu\n", (size_t)cpus[i].cpu_times.sys);
-    fprintf(stderr, "  times.user: %zu\n", (size_t)cpus[i].cpu_times.user);
-    fprintf(stderr, "  times.idle: %zu\n", (size_t)cpus[i].cpu_times.idle);
-    fprintf(stderr, "  times.irq: %zu\n", (size_t)cpus[i].cpu_times.irq);
-    fprintf(stderr, "  times.nice: %zu\n", (size_t)cpus[i].cpu_times.nice);
+    printf("  model: %s\n", cpus[i].model);
+    printf("  speed: %d\n", cpus[i].speed);
+    printf("  times.sys: %llu\n", (unsigned long long) cpus[i].cpu_times.sys);
+    printf("  times.user: %llu\n",
+           (unsigned long long) cpus[i].cpu_times.user);
+    printf("  times.idle: %llu\n",
+           (unsigned long long) cpus[i].cpu_times.idle);
+    printf("  times.irq: %llu\n",  (unsigned long long) cpus[i].cpu_times.irq);
+    printf("  times.nice: %llu\n",
+           (unsigned long long) cpus[i].cpu_times.nice);
   }
   uv_free_cpu_info(cpus, count);
 
   err = uv_interface_addresses(&interfaces, &count);
-  ASSERT(UV_OK == err.code);
+  ASSERT(err == 0);
 
-  fprintf(stderr, "uv_interface_addresses:\n");
+  printf("uv_interface_addresses:\n");
   for (i = 0; i < count; i++) {
-    fprintf(stderr, "  name: %s\n", interfaces[i].name);
-    fprintf(stderr, "  internal: %d\n", interfaces[i].is_internal);
+    printf("  name: %s\n", interfaces[i].name);
+    printf("  internal: %d\n", interfaces[i].is_internal);
+    printf("  physical address: ");
+    printf("%02x:%02x:%02x:%02x:%02x:%02x\n",
+           (unsigned char)interfaces[i].phys_addr[0],
+           (unsigned char)interfaces[i].phys_addr[1],
+           (unsigned char)interfaces[i].phys_addr[2],
+           (unsigned char)interfaces[i].phys_addr[3],
+           (unsigned char)interfaces[i].phys_addr[4],
+           (unsigned char)interfaces[i].phys_addr[5]);
 
     if (interfaces[i].address.address4.sin_family == AF_INET) {
       uv_ip4_name(&interfaces[i].address.address4, buffer, sizeof(buffer));
@@ -75,7 +87,15 @@ TEST_IMPL(platform_output) {
       uv_ip6_name(&interfaces[i].address.address6, buffer, sizeof(buffer));
     }
 
-    fprintf(stderr, "  address: %s\n", buffer);
+    printf("  address: %s\n", buffer);
+
+    if (interfaces[i].netmask.netmask4.sin_family == AF_INET) {
+      uv_ip4_name(&interfaces[i].netmask.netmask4, buffer, sizeof(buffer));
+    } else if (interfaces[i].netmask.netmask4.sin_family == AF_INET6) {
+      uv_ip6_name(&interfaces[i].netmask.netmask6, buffer, sizeof(buffer));
+    }
+
+    printf("  netmask: %s\n", buffer);
   }
   uv_free_interface_addresses(interfaces, count);
 

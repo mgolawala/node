@@ -19,50 +19,47 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#include "node.h"
+#include "async-wrap.h"
+#include "async-wrap-inl.h"
+#include "env.h"
+#include "env-inl.h"
 #include "handle_wrap.h"
+#include "util.h"
+#include "util-inl.h"
 
-#define UNWRAP \
-  assert(!args.Holder().IsEmpty()); \
-  assert(args.Holder()->InternalFieldCount() > 0); \
-  TimerWrap* wrap =  \
-      static_cast<TimerWrap*>(args.Holder()->GetPointerFromInternalField(0)); \
-  if (!wrap) { \
-    uv_err_t err; \
-    err.code = UV_EBADF; \
-    SetErrno(err); \
-    return scope.Close(Integer::New(-1)); \
-  }
+#include <stdint.h>
 
 namespace node {
 
-using v8::Object;
-using v8::Handle;
-using v8::Local;
-using v8::Persistent;
-using v8::Value;
-using v8::HandleScope;
-using v8::FunctionTemplate;
-using v8::String;
-using v8::Function;
-using v8::TryCatch;
 using v8::Context;
-using v8::Arguments;
+using v8::Function;
+using v8::FunctionCallbackInfo;
+using v8::FunctionTemplate;
+using v8::Handle;
+using v8::HandleScope;
 using v8::Integer;
+using v8::Local;
+using v8::Object;
+using v8::Value;
 
+const uint32_t kOnTimeout = 0;
 
 class TimerWrap : public HandleWrap {
  public:
-  static void Initialize(Handle<Object> target) {
-    HandleScope scope;
-
-    HandleWrap::Initialize(target);
-
+  static void Initialize(Handle<Object> target,
+                         Handle<Value> unused,
+                         Handle<Context> context) {
     Local<FunctionTemplate> constructor = FunctionTemplate::New(New);
     constructor->InstanceTemplate()->SetInternalFieldCount(1);
-    constructor->SetClassName(String::NewSymbol("Timer"));
+    constructor->SetClassName(FIXED_ONE_BYTE_STRING(node_isolate, "Timer"));
+    constructor->Set(FIXED_ONE_BYTE_STRING(node_isolate, "kOnTimeout"),
+                     Integer::New(kOnTimeout, node_isolate));
+
+    NODE_SET_METHOD(constructor, "now", Now);
 
     NODE_SET_PROTOTYPE_METHOD(constructor, "close", HandleWrap::Close);
+    NODE_SET_PROTOTYPE_METHOD(constructor, "ref", HandleWrap::Ref);
+    NODE_SET_PROTOTYPE_METHOD(constructor, "unref", HandleWrap::Unref);
 
     NODE_SET_PROTOTYPE_METHOD(constructor, "start", Start);
     NODE_SET_PROTOTYPE_METHOD(constructor, "stop", Stop);
@@ -70,147 +67,94 @@ class TimerWrap : public HandleWrap {
     NODE_SET_PROTOTYPE_METHOD(constructor, "getRepeat", GetRepeat);
     NODE_SET_PROTOTYPE_METHOD(constructor, "again", Again);
 
-    target->Set(String::NewSymbol("Timer"), constructor->GetFunction());
+    target->Set(FIXED_ONE_BYTE_STRING(node_isolate, "Timer"),
+                constructor->GetFunction());
   }
 
  private:
-  static Handle<Value> New(const Arguments& args) {
+  static void New(const FunctionCallbackInfo<Value>& args) {
     // This constructor should not be exposed to public javascript.
     // Therefore we assert that we are not trying to call this as a
     // normal function.
     assert(args.IsConstructCall());
-
-    HandleScope scope;
-    TimerWrap *wrap = new TimerWrap(args.This());
-    assert(wrap);
-
-    return scope.Close(args.This());
+    HandleScope handle_scope(args.GetIsolate());
+    Environment* env = Environment::GetCurrent(args.GetIsolate());
+    new TimerWrap(env, args.This());
   }
 
-  TimerWrap(Handle<Object> object)
-      : HandleWrap(object, (uv_handle_t*) &handle_) {
-    active_ = false;
-
-    int r = uv_timer_init(uv_default_loop(), &handle_);
+  TimerWrap(Environment* env, Handle<Object> object)
+      : HandleWrap(env, object, reinterpret_cast<uv_handle_t*>(&handle_)) {
+    int r = uv_timer_init(env->event_loop(), &handle_);
     assert(r == 0);
-
-    handle_.data = this;
-
-    // uv_timer_init adds a loop reference. (That is, it calls uv_ref.) This
-    // is not the behavior we want in Node. Timers should not increase the
-    // ref count of the loop except when active.
-    uv_unref(uv_default_loop());
   }
 
   ~TimerWrap() {
-    if (!active_) uv_ref(uv_default_loop());
   }
 
-  void StateChange() {
-    bool was_active = active_;
-    active_ = uv_is_active((uv_handle_t*) &handle_);
-
-    if (!was_active && active_) {
-      // If our state is changing from inactive to active, we
-      // increase the loop's reference count.
-      uv_ref(uv_default_loop());
-    } else if (was_active && !active_) {
-      // If our state is changing from active to inactive, we
-      // decrease the loop's reference count.
-      uv_unref(uv_default_loop());
-    }
-  }
-
-  static Handle<Value> Start(const Arguments& args) {
-    HandleScope scope;
-
-    UNWRAP
+  static void Start(const FunctionCallbackInfo<Value>& args) {
+    HandleScope scope(node_isolate);
+    TimerWrap* wrap = Unwrap<TimerWrap>(args.This());
 
     int64_t timeout = args[0]->IntegerValue();
     int64_t repeat = args[1]->IntegerValue();
-
-    int r = uv_timer_start(&wrap->handle_, OnTimeout, timeout, repeat);
-
-    // Error starting the timer.
-    if (r) SetErrno(uv_last_error(uv_default_loop()));
-
-    wrap->StateChange();
-
-    return scope.Close(Integer::New(r));
+    int err = uv_timer_start(&wrap->handle_, OnTimeout, timeout, repeat);
+    args.GetReturnValue().Set(err);
   }
 
-  static Handle<Value> Stop(const Arguments& args) {
-    HandleScope scope;
+  static void Stop(const FunctionCallbackInfo<Value>& args) {
+    HandleScope scope(node_isolate);
+    TimerWrap* wrap = Unwrap<TimerWrap>(args.This());
 
-    UNWRAP
-
-    int r = uv_timer_stop(&wrap->handle_);
-
-    if (r) SetErrno(uv_last_error(uv_default_loop()));
-
-    wrap->StateChange();
-
-    return scope.Close(Integer::New(r));
+    int err = uv_timer_stop(&wrap->handle_);
+    args.GetReturnValue().Set(err);
   }
 
-  static Handle<Value> Again(const Arguments& args) {
-    HandleScope scope;
+  static void Again(const FunctionCallbackInfo<Value>& args) {
+    HandleScope scope(node_isolate);
+    TimerWrap* wrap = Unwrap<TimerWrap>(args.This());
 
-    UNWRAP
-
-    int r = uv_timer_again(&wrap->handle_);
-
-    if (r) SetErrno(uv_last_error(uv_default_loop()));
-
-    wrap->StateChange();
-
-    return scope.Close(Integer::New(r));
+    int err = uv_timer_again(&wrap->handle_);
+    args.GetReturnValue().Set(err);
   }
 
-  static Handle<Value> SetRepeat(const Arguments& args) {
-    HandleScope scope;
-
-    UNWRAP
+  static void SetRepeat(const FunctionCallbackInfo<Value>& args) {
+    HandleScope scope(node_isolate);
+    TimerWrap* wrap = Unwrap<TimerWrap>(args.This());
 
     int64_t repeat = args[0]->IntegerValue();
-
     uv_timer_set_repeat(&wrap->handle_, repeat);
-
-    return scope.Close(Integer::New(0));
+    args.GetReturnValue().Set(0);
   }
 
-  static Handle<Value> GetRepeat(const Arguments& args) {
-    HandleScope scope;
-
-    UNWRAP
+  static void GetRepeat(const FunctionCallbackInfo<Value>& args) {
+    HandleScope scope(node_isolate);
+    TimerWrap* wrap = Unwrap<TimerWrap>(args.This());
 
     int64_t repeat = uv_timer_get_repeat(&wrap->handle_);
-
-    if (repeat < 0) SetErrno(uv_last_error(uv_default_loop()));
-
-    return scope.Close(Integer::New(repeat));
+    args.GetReturnValue().Set(static_cast<double>(repeat));
   }
 
   static void OnTimeout(uv_timer_t* handle, int status) {
-    HandleScope scope;
-
     TimerWrap* wrap = static_cast<TimerWrap*>(handle->data);
-    assert(wrap);
+    Environment* env = wrap->env();
+    HandleScope handle_scope(env->isolate());
+    Context::Scope context_scope(env->context());
+    Local<Value> argv[1] = { Integer::New(status, node_isolate) };
+    wrap->MakeCallback(kOnTimeout, ARRAY_SIZE(argv), argv);
+  }
 
-    wrap->StateChange();
-
-    Local<Value> argv[1] = { Integer::New(status) };
-    MakeCallback(wrap->object_, "ontimeout", 1, argv);
+  static void Now(const FunctionCallbackInfo<Value>& args) {
+    HandleScope handle_scope(args.GetIsolate());
+    Environment* env = Environment::GetCurrent(args.GetIsolate());
+    uv_update_time(env->event_loop());
+    double now = static_cast<double>(uv_now(env->event_loop()));
+    args.GetReturnValue().Set(now);
   }
 
   uv_timer_t handle_;
-  // This member is set false initially. When the timer is turned
-  // on uv_ref is called. When the timer is turned off uv_unref is
-  // called. Used to mirror libev semantics.
-  bool active_;
 };
 
 
 }  // namespace node
 
-NODE_MODULE(node_timer_wrap, node::TimerWrap::Initialize)
+NODE_MODULE_CONTEXT_AWARE(node_timer_wrap, node::TimerWrap::Initialize)

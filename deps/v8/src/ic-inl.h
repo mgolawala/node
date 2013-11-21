@@ -40,10 +40,10 @@ namespace internal {
 
 Address IC::address() const {
   // Get the address of the call.
-  Address result = pc() - Assembler::kCallTargetAddressOffset;
+  Address result = Assembler::target_address_from_return_address(pc());
 
 #ifdef ENABLE_DEBUGGER_SUPPORT
-  Debug* debug = Isolate::Current()->debug();
+  Debug* debug = isolate()->debug();
   // First check if any break points are active if not just return the address
   // of the call.
   if (!debug->has_break_points()) return result;
@@ -79,6 +79,7 @@ Code* IC::GetTargetAtAddress(Address address) {
 
 void IC::SetTargetAtAddress(Address address, Code* target) {
   ASSERT(target->is_inline_cache_stub() || target->is_compare_ic_stub());
+  Heap* heap = target->GetHeap();
   Code* old_target = GetTargetAtAddress(address);
 #ifdef DEBUG
   // STORE_IC and KEYED_STORE_IC use Code::extra_ic_state() to mark
@@ -90,42 +91,31 @@ void IC::SetTargetAtAddress(Address address, Code* target) {
   }
 #endif
   Assembler::set_target_address_at(address, target->instruction_start());
-  target->GetHeap()->incremental_marking()->RecordCodeTargetPatch(address,
-                                                                  target);
+  if (heap->gc_state() == Heap::MARK_COMPACT) {
+    heap->mark_compact_collector()->RecordCodeTargetPatch(address, target);
+  } else {
+    heap->incremental_marking()->RecordCodeTargetPatch(address, target);
+  }
   PostPatching(address, target, old_target);
 }
 
 
 InlineCacheHolderFlag IC::GetCodeCacheForObject(Object* object,
                                                 JSObject* holder) {
-  if (object->IsJSObject()) {
-    return GetCodeCacheForObject(JSObject::cast(object), holder);
-  }
+  if (object->IsJSObject()) return OWN_MAP;
+
   // If the object is a value, we use the prototype map for the cache.
-  ASSERT(object->IsString() || object->IsNumber() || object->IsBoolean());
+  ASSERT(object->IsString() || object->IsSymbol() ||
+         object->IsNumber() || object->IsBoolean());
   return PROTOTYPE_MAP;
 }
 
 
-InlineCacheHolderFlag IC::GetCodeCacheForObject(JSObject* object,
-                                                JSObject* holder) {
-  // Fast-properties and global objects store stubs in their own maps.
-  // Slow properties objects use prototype's map (unless the property is its own
-  // when holder == object). It works because slow properties objects having
-  // the same prototype (or a prototype with the same map) and not having
-  // the property are interchangeable for such a stub.
-  if (holder != object &&
-      !object->HasFastProperties() &&
-      !object->IsJSGlobalProxy() &&
-      !object->IsJSGlobalObject()) {
-    return PROTOTYPE_MAP;
-  }
-  return OWN_MAP;
-}
-
-
-JSObject* IC::GetCodeCacheHolder(Object* object, InlineCacheHolderFlag holder) {
-  Object* map_owner = (holder == OWN_MAP ? object : object->GetPrototype());
+JSObject* IC::GetCodeCacheHolder(Isolate* isolate,
+                                 Object* object,
+                                 InlineCacheHolderFlag holder) {
+  Object* map_owner =
+      holder == OWN_MAP ? object : object->GetPrototype(isolate);
   ASSERT(map_owner->IsJSObject());
   return JSObject::cast(map_owner);
 }

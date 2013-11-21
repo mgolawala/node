@@ -65,6 +65,13 @@
 //   static LazyInstance<MyClass, MyCreateTrait>::type my_instance =
 //      LAZY_INSTANCE_INITIALIZER;
 //
+// WARNINGS:
+// - This implementation of LazyInstance is NOT THREAD-SAFE by default. See
+//   ThreadSafeInitOnceTrait declared below for that.
+// - Lazy initialization comes with a cost. Make sure that you don't use it on
+//   critical path. Consider adding your initialization code to a function
+//   which is explicitly called once.
+//
 // Notes for advanced users:
 // LazyInstance can actually be used in two different ways:
 //
@@ -84,12 +91,13 @@
 #ifndef V8_LAZY_INSTANCE_H_
 #define V8_LAZY_INSTANCE_H_
 
+#include "checks.h"
 #include "once.h"
 
 namespace v8 {
 namespace internal {
 
-#define LAZY_STATIC_INSTANCE_INITIALIZER { V8_ONCE_INIT, {} }
+#define LAZY_STATIC_INSTANCE_INITIALIZER { V8_ONCE_INIT, { {} } }
 #define LAZY_DYNAMIC_INSTANCE_INITIALIZER { V8_ONCE_INIT, 0 }
 
 // Default to static mode.
@@ -104,9 +112,15 @@ struct LeakyInstanceTrait {
 
 // Traits that define how an instance is allocated and accessed.
 
+
 template <typename T>
 struct StaticallyAllocatedInstanceTrait {
-  typedef char StorageType[sizeof(T)];
+  // 16-byte alignment fallback to be on the safe side here.
+  struct V8_ALIGNAS(T, 16) StorageType {
+    char x[sizeof(T)];
+  };
+
+  STATIC_ASSERT(V8_ALIGNOF(StorageType) >= V8_ALIGNOF(T));
 
   static T* MutableInstance(StorageType* storage) {
     return reinterpret_cast<T*>(storage);
@@ -151,9 +165,29 @@ struct DefaultCreateTrait {
 };
 
 
+struct ThreadSafeInitOnceTrait {
+  template <typename Function, typename Storage>
+  static void Init(OnceType* once, Function function, Storage storage) {
+    CallOnce(once, function, storage);
+  }
+};
+
+
+// Initialization trait for users who don't care about thread-safety.
+struct SingleThreadInitOnceTrait {
+  template <typename Function, typename Storage>
+  static void Init(OnceType* once, Function function, Storage storage) {
+    if (*once == ONCE_STATE_UNINITIALIZED) {
+      function(storage);
+      *once = ONCE_STATE_DONE;
+    }
+  }
+};
+
+
 // TODO(pliard): Handle instances destruction (using global destructors).
 template <typename T, typename AllocationTrait, typename CreateTrait,
-          typename DestroyTrait  /* not used yet. */ >
+          typename InitOnceTrait, typename DestroyTrait  /* not used yet. */>
 struct LazyInstanceImpl {
  public:
   typedef typename AllocationTrait::StorageType StorageType;
@@ -164,7 +198,12 @@ struct LazyInstanceImpl {
   }
 
   void Init() const {
-    CallOnce(&once_, &InitInstance, &storage_);
+    InitOnceTrait::Init(
+        &once_,
+        // Casts to void* are needed here to avoid breaking strict aliasing
+        // rules.
+        reinterpret_cast<void(*)(void*)>(&InitInstance),  // NOLINT
+        reinterpret_cast<void*>(&storage_));
   }
 
  public:
@@ -180,35 +219,40 @@ struct LazyInstanceImpl {
 
   mutable OnceType once_;
   // Note that the previous field, OnceType, is an AtomicWord which guarantees
-  // the correct alignment of the storage field below.
+  // 4-byte alignment of the storage field below. If compiling with GCC (>4.2),
+  // the LAZY_ALIGN macro above will guarantee correctness for any alignment.
   mutable StorageType storage_;
 };
 
 
 template <typename T,
           typename CreateTrait = DefaultConstructTrait<T>,
+          typename InitOnceTrait = SingleThreadInitOnceTrait,
           typename DestroyTrait = LeakyInstanceTrait<T> >
 struct LazyStaticInstance {
-  typedef LazyInstanceImpl<T, StaticallyAllocatedInstanceTrait<T>, CreateTrait,
-      DestroyTrait> type;
+  typedef LazyInstanceImpl<T, StaticallyAllocatedInstanceTrait<T>,
+      CreateTrait, InitOnceTrait, DestroyTrait> type;
 };
 
 
 template <typename T,
           typename CreateTrait = DefaultConstructTrait<T>,
+          typename InitOnceTrait = SingleThreadInitOnceTrait,
           typename DestroyTrait = LeakyInstanceTrait<T> >
 struct LazyInstance {
   // A LazyInstance is a LazyStaticInstance.
-  typedef typename LazyStaticInstance<T, CreateTrait, DestroyTrait>::type type;
+  typedef typename LazyStaticInstance<T, CreateTrait, InitOnceTrait,
+      DestroyTrait>::type type;
 };
 
 
 template <typename T,
-          typename CreateTrait = DefaultConstructTrait<T>,
+          typename CreateTrait = DefaultCreateTrait<T>,
+          typename InitOnceTrait = SingleThreadInitOnceTrait,
           typename DestroyTrait = LeakyInstanceTrait<T> >
 struct LazyDynamicInstance {
-  typedef LazyInstanceImpl<T, DynamicallyAllocatedInstanceTrait<T>, CreateTrait,
-      DestroyTrait> type;
+  typedef LazyInstanceImpl<T, DynamicallyAllocatedInstanceTrait<T>,
+      CreateTrait, InitOnceTrait, DestroyTrait> type;
 };
 
 } }  // namespace v8::internal

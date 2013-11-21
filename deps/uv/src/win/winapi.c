@@ -22,17 +22,23 @@
 #include <assert.h>
 
 #include "uv.h"
-#include "../uv-common.h"
 #include "internal.h"
 
 
+/* Ntdll function pointers */
 sRtlNtStatusToDosError pRtlNtStatusToDosError;
 sNtDeviceIoControlFile pNtDeviceIoControlFile;
 sNtQueryInformationFile pNtQueryInformationFile;
 sNtSetInformationFile pNtSetInformationFile;
+sNtQueryVolumeInformationFile pNtQueryVolumeInformationFile;
+sNtQuerySystemInformation pNtQuerySystemInformation;
+
+
+/* Kernel32 function pointers */
 sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
 sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
 sCreateSymbolicLinkW pCreateSymbolicLinkW;
+sCancelIoEx pCancelIoEx;
 sInitializeSRWLock pInitializeSRWLock;
 sAcquireSRWLockShared pAcquireSRWLockShared;
 sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
@@ -40,6 +46,11 @@ sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
 sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
 sReleaseSRWLockShared pReleaseSRWLockShared;
 sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
+sInitializeConditionVariable pInitializeConditionVariable;
+sSleepConditionVariableCS pSleepConditionVariableCS;
+sSleepConditionVariableSRW pSleepConditionVariableSRW;
+sWakeAllConditionVariable pWakeAllConditionVariable;
+sWakeConditionVariable pWakeConditionVariable;
 
 
 void uv_winapi_init() {
@@ -58,13 +69,6 @@ void uv_winapi_init() {
     uv_fatal_error(GetLastError(), "GetProcAddress");
   }
 
-  pNtQueryInformationFile = (sNtQueryInformationFile) GetProcAddress(
-      ntdll_module,
-      "NtQueryInformationFile");
-  if (pNtQueryInformationFile == NULL) {
-    uv_fatal_error(GetLastError(), "GetProcAddress");
-  }
-
   pNtDeviceIoControlFile = (sNtDeviceIoControlFile) GetProcAddress(
       ntdll_module,
       "NtDeviceIoControlFile");
@@ -72,10 +76,30 @@ void uv_winapi_init() {
     uv_fatal_error(GetLastError(), "GetProcAddress");
   }
 
+  pNtQueryInformationFile = (sNtQueryInformationFile) GetProcAddress(
+      ntdll_module,
+      "NtQueryInformationFile");
+  if (pNtQueryInformationFile == NULL) {
+    uv_fatal_error(GetLastError(), "GetProcAddress");
+  }
+
   pNtSetInformationFile = (sNtSetInformationFile) GetProcAddress(
       ntdll_module,
       "NtSetInformationFile");
   if (pNtSetInformationFile == NULL) {
+    uv_fatal_error(GetLastError(), "GetProcAddress");
+  }
+
+  pNtQueryVolumeInformationFile = (sNtQueryVolumeInformationFile)
+      GetProcAddress(ntdll_module, "NtQueryVolumeInformationFile");
+  if (pNtQueryVolumeInformationFile == NULL) {
+    uv_fatal_error(GetLastError(), "GetProcAddress");
+  }
+
+  pNtQuerySystemInformation = (sNtQuerySystemInformation) GetProcAddress(
+      ntdll_module,
+      "NtQuerySystemInformation");
+  if (pNtQuerySystemInformation == NULL) {
     uv_fatal_error(GetLastError(), "GetProcAddress");
   }
 
@@ -93,6 +117,9 @@ void uv_winapi_init() {
 
   pCreateSymbolicLinkW = (sCreateSymbolicLinkW)
     GetProcAddress(kernel32_module, "CreateSymbolicLinkW");
+
+  pCancelIoEx = (sCancelIoEx)
+    GetProcAddress(kernel32_module, "CancelIoEx");
 
   pInitializeSRWLock = (sInitializeSRWLock)
     GetProcAddress(kernel32_module, "InitializeSRWLock");
@@ -114,4 +141,19 @@ void uv_winapi_init() {
 
   pReleaseSRWLockExclusive = (sReleaseSRWLockExclusive)
     GetProcAddress(kernel32_module, "ReleaseSRWLockExclusive");
+
+  pInitializeConditionVariable = (sInitializeConditionVariable)
+    GetProcAddress(kernel32_module, "InitializeConditionVariable");
+
+  pSleepConditionVariableCS = (sSleepConditionVariableCS)
+    GetProcAddress(kernel32_module, "SleepConditionVariableCS");
+
+  pSleepConditionVariableSRW = (sSleepConditionVariableSRW)
+    GetProcAddress(kernel32_module, "SleepConditionVariableSRW");
+
+  pWakeAllConditionVariable = (sWakeAllConditionVariable)
+    GetProcAddress(kernel32_module, "WakeAllConditionVariable");
+
+  pWakeConditionVariable = (sWakeConditionVariable)
+    GetProcAddress(kernel32_module, "WakeConditionVariable");
 }

@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -26,6 +26,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Flags: --allow-natives-syntax --smi-only-arrays --expose-gc
+
 // Test element kind of objects.
 // Since --smi-only-arrays affects builtins, its default setting at compile
 // time sticks if built with snapshot.  If --smi-only-arrays is deactivated
@@ -33,7 +34,7 @@
 // in this test case.  Depending on whether smi-only arrays are actually
 // enabled, this test takes the appropriate code path to check smi-only arrays.
 
-support_smi_only_arrays = %HasFastSmiOnlyElements([1,2,3,4,5,6,7,8,9,10]);
+support_smi_only_arrays = %HasFastSmiElements([1,2,3,4,5,6,7,8,9,10]);
 
 if (support_smi_only_arrays) {
   print("Tests include smi-only arrays.");
@@ -46,14 +47,14 @@ function get(foo) { return foo; }  // Used to generate dynamic values.
 
 function array_literal_test() {
   var a0 = [1, 2, 3];
-  assertTrue(%HasFastSmiOnlyElements(a0));
+  assertTrue(%HasFastSmiElements(a0));
   var a1 = [get(1), get(2), get(3)];
-  assertTrue(%HasFastSmiOnlyElements(a1));
+  assertTrue(%HasFastSmiElements(a1));
 
   var b0 = [1, 2, get("three")];
-  assertTrue(%HasFastElements(b0));
+  assertTrue(%HasFastObjectElements(b0));
   var b1 = [get(1), get(2), get("three")];
-  assertTrue(%HasFastElements(b1));
+  assertTrue(%HasFastObjectElements(b1));
 
   var c0 = [1, 2, get(3.5)];
   assertTrue(%HasFastDoubleElements(c0));
@@ -75,7 +76,7 @@ function array_literal_test() {
 
   var object = new Object();
   var d0 = [1, 2, object];
-  assertTrue(%HasFastElements(d0));
+  assertTrue(%HasFastObjectElements(d0));
   assertEquals(object, d0[2]);
   assertEquals(2, d0[1]);
   assertEquals(1, d0[0]);
@@ -87,7 +88,7 @@ function array_literal_test() {
   assertEquals(1, e0[0]);
 
   var f0 = [1, 2, [1, 2]];
-  assertTrue(%HasFastElements(f0));
+  assertTrue(%HasFastObjectElements(f0));
   assertEquals([1,2], f0[2]);
   assertEquals(2, f0[1]);
   assertEquals(1, f0[0]);
@@ -115,9 +116,9 @@ if (support_smi_only_arrays) {
     large =
         [ 0, 1, 2, 3, 4, 5, d(), d(), d(), d(), d(), d(), o(), o(), o(), o() ];
     assertFalse(%HasDictionaryElements(large));
-    assertFalse(%HasFastSmiOnlyElements(large));
+    assertFalse(%HasFastSmiElements(large));
     assertFalse(%HasFastDoubleElements(large));
-    assertTrue(%HasFastElements(large));
+    assertTrue(%HasFastObjectElements(large));
     assertEquals(large,
                  [0, 1, 2, 3, 4, 5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5,
                   new Object(), new Object(), new Object(), new Object()]);
@@ -142,11 +143,11 @@ if (support_smi_only_arrays) {
   deopt_array(false);
   %OptimizeFunctionOnNextCall(deopt_array);
   var array = deopt_array(false);
-  assertTrue(2 != %GetOptimizationStatus(deopt_array));
+  assertOptimized(deopt_array);
   deopt_array(true);
-  assertTrue(2 != %GetOptimizationStatus(deopt_array));
+  assertOptimized(deopt_array);
   array = deopt_array(false);
-  assertTrue(2 != %GetOptimizationStatus(deopt_array));
+  assertOptimized(deopt_array);
 
   // Check that unexpected changes in the objects stored into the boilerplate
   // also force a deopt.
@@ -164,13 +165,13 @@ if (support_smi_only_arrays) {
   %OptimizeFunctionOnNextCall(deopt_array_literal_all_smis);
   array = deopt_array_literal_all_smis(5);
   array = deopt_array_literal_all_smis(6);
-  assertTrue(2 != %GetOptimizationStatus(deopt_array_literal_all_smis));
+  assertOptimized(deopt_array_literal_all_smis);
   assertEquals(0, array[0]);
   assertEquals(1, array[1]);
   assertEquals(6, array[2]);
 
   array = deopt_array_literal_all_smis(.5);
-  assertTrue(1 != %GetOptimizationStatus(deopt_array_literal_all_smis));
+  assertUnoptimized(deopt_array_literal_all_smis);
   assertEquals(0, array[0]);
   assertEquals(1, array[1]);
   assertEquals(.5, array[2]);
@@ -189,14 +190,14 @@ if (support_smi_only_arrays) {
   %OptimizeFunctionOnNextCall(deopt_array_literal_all_doubles);
   array = deopt_array_literal_all_doubles(5);
   array = deopt_array_literal_all_doubles(6);
-  assertTrue(2 != %GetOptimizationStatus(deopt_array_literal_all_doubles));
+  assertOptimized(deopt_array_literal_all_doubles);
   assertEquals(0.5, array[0]);
   assertEquals(1, array[1]);
   assertEquals(6, array[2]);
 
   var foo = new Object();
   array = deopt_array_literal_all_doubles(foo);
-  assertTrue(1 != %GetOptimizationStatus(deopt_array_literal_all_doubles));
+  assertUnoptimized(deopt_array_literal_all_doubles);
   assertEquals(0.5, array[0]);
   assertEquals(1, array[1]);
   assertEquals(foo, array[2]);
@@ -204,7 +205,9 @@ if (support_smi_only_arrays) {
 
 (function literals_after_osr() {
   var color = [0];
-  // Trigger OSR.
-  while (%GetOptimizationStatus(literals_after_osr) == 2) {}
+  // Trigger OSR, if optimization is not disabled.
+  if (%GetOptimizationStatus(literals_after_osr) != 4) {
+    while (%GetOptimizationCount(literals_after_osr) == 0) {}
+  }
   return [color[0]];
 })();

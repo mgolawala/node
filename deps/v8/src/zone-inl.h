@@ -40,7 +40,6 @@ namespace internal {
 
 
 inline void* Zone::New(int size) {
-  ASSERT(ZoneScope::nesting() > 0);
   // Round up the requested size to fit the alignment.
   size = RoundUp(size, kAlignment);
 
@@ -75,7 +74,7 @@ T* Zone::NewArray(int length) {
 
 
 bool Zone::excess_allocation() {
-  return segment_bytes_allocated_ > zone_excess_limit_;
+  return segment_bytes_allocated_ > kExcessLimit;
 }
 
 
@@ -90,30 +89,17 @@ ZoneSplayTree<Config>::~ZoneSplayTree() {
   // Reset the root to avoid unneeded iteration over all tree nodes
   // in the destructor.  For a zone-allocated tree, nodes will be
   // freed by the Zone.
-  SplayTree<Config, ZoneListAllocationPolicy>::ResetRoot();
+  SplayTree<Config, ZoneAllocationPolicy>::ResetRoot();
 }
 
-
-// TODO(isolates): for performance reasons, this should be replaced with a new
-//                 operator that takes the zone in which the object should be
-//                 allocated.
-void* ZoneObject::operator new(size_t size) {
-  return ZONE->New(static_cast<int>(size));
-}
 
 void* ZoneObject::operator new(size_t size, Zone* zone) {
   return zone->New(static_cast<int>(size));
 }
 
-
-inline void* ZoneListAllocationPolicy::New(int size) {
-  return ZONE->New(size);
-}
-
-
-template <typename T>
-void* ZoneList<T>::operator new(size_t size) {
-  return ZONE->New(static_cast<int>(size));
+inline void* ZoneAllocationPolicy::New(size_t size) {
+  ASSERT(zone_);
+  return zone_->New(static_cast<int>(size));
 }
 
 
@@ -123,19 +109,9 @@ void* ZoneList<T>::operator new(size_t size, Zone* zone) {
 }
 
 
-ZoneScope::ZoneScope(Isolate* isolate, ZoneScopeMode mode)
-    : isolate_(isolate), mode_(mode) {
-  isolate_->zone()->scope_nesting_++;
-}
-
-
-bool ZoneScope::ShouldDeleteOnExit() {
-  return isolate_->zone()->scope_nesting_ == 1 && mode_ == DELETE_ON_EXIT;
-}
-
-
-int ZoneScope::nesting() {
-  return Isolate::Current()->zone()->scope_nesting_;
+template <typename T>
+void* ZoneSplayTree<T>::operator new(size_t size, Zone* zone) {
+  return zone->New(static_cast<int>(size));
 }
 
 

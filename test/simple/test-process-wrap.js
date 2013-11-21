@@ -44,7 +44,7 @@ p.onexit = function(exitCode, signal) {
   processExited = true;
 };
 
-pipe.onread = function(b, off, len) {
+pipe.onread = function(err, b, off, len) {
   assert.ok(processExited);
   if (b) {
     gotPipeData = true;
@@ -58,7 +58,11 @@ pipe.onread = function(b, off, len) {
 p.spawn({
   file: process.execPath,
   args: [process.execPath, '-v'],
-  stdoutStream: pipe
+  stdio: [
+    { type: 'ignore' },
+    { type: 'pipe', handle: pipe },
+    { type: 'ignore' }
+  ]
 });
 
 
